@@ -49,7 +49,7 @@ LOGIN    = int(os.environ.get("MT5_LOGIN",    0))
 PASSWORD =     os.environ.get("MT5_PASSWORD", "")
 SERVER   =     os.environ.get("MT5_SERVER",   "")
 
-CSV_DIR = os.environ.get("ORB_CSV_DIR", r"C:\Users\MJ\OneDrive\Documents")
+CSV_DIR = os.environ.get("ORB_CSV_DIR", r"C:\Users\Administrator\Documents")
 
 # ── Broker constants ────────────────────────────────────────────────────────
 STARTING_BALANCE  = 25_000.0
