@@ -93,7 +93,7 @@ PARAMS_GRID_BEST = {
 }
 
 SYMBOL_ALIASES = {
-    "US30":  ["US30C",  "US30.cash", "US30",  "DJ30",  "DJIA",  "WS30",  "DOW30",  "US30Cash"],
+    "US30":  ["US30C",  "US30.cash", "US30",  "DJI30",  "DJIA",  "WS30",  "DOW30",  "US30Cash"],
     "US500": ["US500",  "SPX500",    "SP500", "SPX",   "US500Cash"],
     "UK100": ["UK100",  "FTSE100",   "FTSE",  "UK100Cash", "UKX"],
     "GER40": ["DE40C",  "GER40.cash","GER40", "DAX40", "DAX",   "GER30", "DE40",   "GER40Cash"],
