@@ -910,6 +910,61 @@ def compute_vol_max_cap(sl_dist, tick_value_per_lot, max_trades_per_day_combo):
     return round(cap, 8)
 
 
+# ── FIX: chronological entry/exit resolution ───────────────────────────────
+#
+# BUG (pre-fix): the old loop below processed signals in ENTRY order and
+# applied each trade's realized PnL to `balance` immediately, in that same
+# entry-order pass. That means position sizing for a later-ENTERED trade
+# could reflect the PnL of an earlier-ENTERED trade that, in real time,
+# hadn't actually EXITED yet (ORB holds can run up to MAX_HOLD=48 bars =
+# 4 hours, so overlap across symbols in multi-symbol combos is common).
+# The R-multiple of each trade (outcome_r) is unaffected — it only depends
+# on price action — so expectancy/win-rate/profit-factor stats computed
+# from per-trade R are unchanged. What's wrong is everything downstream of
+# lot sizing: final balance, drawdown, and (via lot-dependent daily-loss
+# breaches) the FTMO eval pass rate.
+#
+# FIX: resolve every trade's outcome up front (deterministic, balance-
+# independent), then replay a single merged timeline of ENTRY and EXIT
+# events in true chronological order. Lot size is computed at ENTRY time
+# using only the balance that has actually been realized (i.e. reflects
+# only trades that have already EXITED by that timestamp). PnL is applied
+# to `balance` only at EXIT time.
+
+def _resolve_all_trades(symbols: list, caches: dict, resolver_fn) -> list:
+    """Pre-resolve every signal's outcome (price-action only, no balance
+    dependency) and attach its entry/exit timestamps for chronological replay."""
+    trades = []
+    for sym in symbols:
+        cache = caches[sym]
+        for si in cache["signal_bars"]:
+            outcome_r, exit_bar, ep, sl_dist = resolver_fn(cache, si)
+            if outcome_r is None:
+                continue
+            entry_time = cache["times"][si] + _BAR_DURATION
+            exit_time  = cache["times"][exit_bar] + _BAR_DURATION
+            trades.append({
+                "sym": sym, "si": si, "cache": cache,
+                "entry_time": entry_time, "exit_time": exit_time,
+                "outcome_r": outcome_r, "sl_dist": sl_dist,
+            })
+    trades.sort(key=lambda t: t["entry_time"])
+    return trades
+
+
+def _build_chrono_events(trades: list) -> list:
+    """Merge entries and exits into one chronologically sorted event list.
+    On an exact timestamp tie, EXIT is processed before ENTRY so that a
+    trade closing at the same instant another opens never lets the new
+    entry see PnL from a trade that, mechanically, hadn't closed yet."""
+    events = []
+    for idx, t in enumerate(trades):
+        events.append((t["entry_time"], 1, idx))  # 1 = ENTRY
+        events.append((t["exit_time"],  0, idx))  # 0 = EXIT  (sorts first on tie)
+    events.sort(key=lambda e: (e[0], e[1]))
+    return events
+
+
 def _run_simulation_core(combo_name: str, mode_label: str,
                           symbols: list, all_caches: dict,
                           tick_values: dict,
@@ -924,7 +979,11 @@ def _run_simulation_core(combo_name: str, mode_label: str,
     )
 
     caches = {sym: all_caches[sym] for sym in symbols}
-    events = build_master_timeline(caches)
+    # kept for the log line / event count parity with previous behaviour
+    build_master_timeline(caches)
+
+    trades = _resolve_all_trades(symbols, caches, resolver_fn)
+    chrono = _build_chrono_events(trades)
 
     balance  = STARTING_BALANCE
     peak_bal = STARTING_BALANCE
@@ -934,22 +993,30 @@ def _run_simulation_core(combo_name: str, mode_label: str,
 
     per_sym = {sym: {"r": [], "pnl": [], "rejected": 0} for sym in symbols}
     r_tracker = RTracker(combo_name, mode_label)
+    open_state: dict = {}   # idx -> {"lot": float, "rejected": bool}
 
-    for bar_close_ts, sym, si in events:
-        cache = caches[sym]
+    for t_time, etype, idx in chrono:
+        t     = trades[idx]
+        sym   = t["sym"]
+        cache = t["cache"]
         tvpl  = tick_values[sym]
+        sl_dist = t["sl_dist"]
 
-        outcome_r, exit_bar, ep, sl_dist = resolver_fn(cache, si)
-        if outcome_r is None:
+        if etype == 1:  # ENTRY — size using balance realized so far
+            vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day_combo)
+            lot, intended, actual_loss, risk_mult, rejected = \
+                compute_lot_aware(balance, sl_dist, tvpl, vol_max_cap)
+            open_state[idx] = {"lot": lot, "rejected": rejected}
+            if rejected:
+                per_sym[sym]["rejected"] += 1
             continue
 
-        vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day_combo)
-        lot, intended, actual_loss, risk_mult, rejected = \
-            compute_lot_aware(balance, sl_dist, tvpl, vol_max_cap)
-
-        if rejected:
-            per_sym[sym]["rejected"] += 1
+        # etype == 0: EXIT — realize PnL into balance now
+        st = open_state.get(idx)
+        if st is None or st["rejected"]:
             continue
+        lot = st["lot"]
+        outcome_r = t["outcome_r"]
 
         pnl      = outcome_r * lot * sl_dist * tvpl
         balance += pnl
@@ -957,6 +1024,7 @@ def _run_simulation_core(combo_name: str, mode_label: str,
         dd       = (peak_bal - balance) / peak_bal if peak_bal > 0 else 0.0
         max_dd   = max(max_dd, dd)
 
+        si = t["si"]
         trade_date = cache["dates"][si + 1]
         entry_hour = int(cache["utc_h"][si + 1])
 
@@ -1164,6 +1232,14 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
     """
     resolver_fn(cache, si) -> (outcome_r, exit_bar, ep, sl_dist).
     Defaults to resolve_mode_a (BE+trail) if not supplied.
+
+    FIX: same chronological entry/exit issue as _run_simulation_core (see
+    comment above that function). `events` here is entry-ordered only; we
+    pre-resolve every trade and replay a merged entry/exit timeline so lot
+    sizing at ENTRY only ever reflects balance that has actually been
+    realized at EXIT, never PnL from trades still open in real time.
+    `open_state` persists across phases/cycles so a trade opened near a
+    phase boundary still resolves its lot correctly when it exits later.
     """
     if resolver_fn is None:
         resolver_fn = resolve_mode_a
@@ -1171,6 +1247,10 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
     max_trades_per_day = sum(
         PARAMS_GRID_BEST[s]["max_trades_day"] for s in symbols
     )
+
+    trades = _resolve_all_trades(symbols, caches, resolver_fn)
+    chrono = _build_chrono_events(trades)
+    open_state: dict = {}   # idx -> {"lot": float, "rejected": bool}  (persists across phases)
 
     def run_phase(target_pct, event_idx):
         nonlocal balance
@@ -1183,29 +1263,34 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
         start_date      = None
         end_date        = None
 
-        while event_idx[0] < len(events):
-            bar_close_ts, sym, si = events[event_idx[0]]
+        while event_idx[0] < len(chrono):
+            t_time, etype, idx = chrono[event_idx[0]]
             event_idx[0] += 1
-
-            cache = caches[sym]
+            t     = trades[idx]
+            sym   = t["sym"]
+            cache = t["cache"]
             tvpl  = tick_values[sym]
+            sl_dist = t["sl_dist"]
 
-            outcome_r, exit_bar, ep, sl_dist = resolver_fn(cache, si)
-            if outcome_r is None:
+            if etype == 1:  # ENTRY — size using balance realized so far
+                vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day)
+                lot, _, _, _, rejected = compute_lot_aware(
+                    balance, sl_dist, tvpl, vol_max_cap)
+                open_state[idx] = {"lot": lot, "rejected": rejected}
+                if start_date is None:
+                    start_date = cache["dates"][t["si"] + 1]
                 continue
 
-            vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day)
-            lot, _, _, _, rejected = compute_lot_aware(
-                balance, sl_dist, tvpl, vol_max_cap)
-            if rejected:
+            # etype == 0: EXIT — realize PnL now
+            st = open_state.get(idx)
+            if st is None or st["rejected"]:
                 continue
+            lot = st["lot"]
+            outcome_r = t["outcome_r"]
 
             pnl        = outcome_r * lot * sl_dist * tvpl
-            trade_date = cache["dates"][si + 1]
-
-            if start_date is None:
-                start_date = trade_date
-            end_date = trade_date
+            trade_date = cache["dates"][t["si"] + 1]
+            end_date   = trade_date
 
             trading_days.add(trade_date)
             day_pnl[trade_date] = day_pnl.get(trade_date, 0.0) + pnl
@@ -1231,7 +1316,7 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
     event_idx = [0]
     cycles    = []
 
-    while event_idx[0] < len(events):
+    while event_idx[0] < len(chrono):
         balance = STARTING_BALANCE
 
         p1_pass, p1_days, p1_trades, p1_start, p1_end, p1_reason = \
