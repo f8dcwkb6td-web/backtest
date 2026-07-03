@@ -6,6 +6,7 @@ ORB  —  CHRONOLOGICAL MULTI-SYMBOL BACKTEST  v3
 
 EXIT MODES (compared per combo, no re-gridding):
   A  CURRENT   — BE at 1R then ATR trailing stop (original logic)
+  A_LONG       — Same as A, but LONG signals only (shorts ignored)
   B  FIXED_RR  — Fixed SL (same sl_dist), exit at first RR target hit
                  Tested at RR 1, 2, 3, 4, 5. Best by expectancy reported.
   C  WIDE_RR   — SL doubled (2× sl_dist), same RR ladder.
@@ -14,12 +15,14 @@ EXIT MODES (compared per combo, no re-gridding):
 Logging changes vs v2:
   • Per-trade inline log REMOVED (verbose noise)
   • Trade-by-trade header block REMOVED
-  • Summary R/loss-cluster stats still printed per combo per mode
-  • Clean 3-way comparison table printed at end
+  • Per-mode detailed R-stat dumps REMOVED (was 60+ lines x 7 combos x 12
+    modes ≈ thousands of lines)
+  • Per-FTMO-cycle attempt logging REMOVED
+  • Replaced with 6 consolidated summary tables printed once at the end
 ==============================================================================
 """
 
-import os, sys, io, logging, bisect, datetime, collections
+import os, sys, io, logging, bisect, datetime
 import numpy as np
 import pandas as pd
 from logging.handlers import RotatingFileHandler
@@ -59,6 +62,20 @@ VOL_STEP          = 0.01
 VOL_MAX           = 250.0
 MAX_RISK_MULTIPLE = 2.0
 FIXED_LOT         = 0.10
+
+# Round-turn commission in USD per 1.00 lot. The backtest previously modeled
+# ZERO transaction cost beyond spread. If live results run cooler than the
+# backtest (e.g. backtest +19% vs live ~breakeven for the same month), an
+# unmodeled commission is one of the most common causes — it doesn't show up
+# in win rate or R-multiples at all, it just quietly eats the edge trade by
+# trade. Set this to your broker's actual round-turn commission per lot for
+# each symbol (defaults to 0.0 = unchanged/backtest-optimistic behavior).
+COMMISSION_PER_LOT = {
+    "US30":  0.0,
+    "US500": 0.0,
+    "UK100": 0.0,
+    "GER40": 0.0,
+}
 
 TICK_VALUE_FALLBACK = {
     "US30":  1.0,
@@ -122,13 +139,13 @@ DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
 
 
 # ==============================================================================
-#  SECTION 0 — R STATS & LOSS CLUSTER HELPERS  (lean — no per-trade logging)
+#  SECTION 0 — R STATS (lean — collects trades, no verbose per-mode dumps)
 # ==============================================================================
 
 class RTracker:
     """
-    Accumulates trade records silently; prints a summary block on request.
-    Per-trade inline logging removed.
+    Accumulates trade records silently. No per-mode printing — all reporting
+    now happens through the consolidated tables built in SECTION 11.
     """
 
     def __init__(self, combo_name: str, mode_label: str,
@@ -137,31 +154,10 @@ class RTracker:
         self.mode         = mode_label
         self.rolling_days = rolling_days
         self.trades: list[dict] = []
-        self._streak          = 0
-        self._cur_streak_type = None
-        self._loss_streaks: list[int] = []
-        self._win_streaks:  list[int] = []
 
     def record(self, *, sym: str, trade_date, entry_hour: int,
                direction: int, outcome_r: float, pnl: float,
                lot: float, balance_after: float):
-
-        cutoff = pd.Timestamp(trade_date) - pd.Timedelta(days=self.rolling_days)
-        recent = [t["outcome_r"] for t in self.trades
-                  if pd.Timestamp(t["trade_date"]) > cutoff]
-        roll_r = float(np.mean(recent)) if recent else float("nan")
-
-        result = "W" if outcome_r > 0 else "L"
-        if result == self._cur_streak_type:
-            self._streak = (abs(self._streak) + 1) * (1 if result == "W" else -1)
-        else:
-            if self._cur_streak_type == "L" and self._streak < 0:
-                self._loss_streaks.append(abs(self._streak))
-            elif self._cur_streak_type == "W" and self._streak > 0:
-                self._win_streaks.append(self._streak)
-            self._streak = 1 if result == "W" else -1
-            self._cur_streak_type = result
-
         self.trades.append({
             "combo":          self.combo,
             "mode":           self.mode,
@@ -170,112 +166,11 @@ class RTracker:
             "entry_hour_utc": entry_hour,
             "direction":      direction,
             "outcome_r":      round(outcome_r, 4),
-            "rolling_7d_r":   round(roll_r, 4) if not np.isnan(roll_r) else None,
             "pnl":            round(pnl, 2),
             "lot":            lot,
             "balance_after":  round(balance_after, 2),
-            "result":         result,
-            "cur_streak":     self._streak,
+            "result":         "W" if outcome_r > 0 else "L",
         })
-
-    def _flush_streaks(self):
-        if self._cur_streak_type == "L" and self._streak < 0:
-            self._loss_streaks.append(abs(self._streak))
-        elif self._cur_streak_type == "W" and self._streak > 0:
-            self._win_streaks.append(self._streak)
-
-    def print_stats(self):
-        self._flush_streaks()
-        trades = self.trades
-        if not trades:
-            logger.info(f"  [{self.combo} | {self.mode}] No trades recorded.")
-            return
-
-        df     = pd.DataFrame(trades)
-        df["trade_date"] = pd.to_datetime(df["trade_date"])
-        r      = df["outcome_r"].values
-        wins   = df[df["result"] == "W"]
-        losses = df[df["result"] == "L"]
-        sep    = "─" * 78
-
-        logger.info(f"\n{'='*78}")
-        logger.info(f"  R STATS — {self.combo}  [{self.mode}]")
-        logger.info(f"{'='*78}")
-        logger.info(f"  {sep}")
-        logger.info(f"  CORE R SUMMARY")
-        logger.info(f"  {sep}")
-        logger.info(f"  Trades          : {len(r):,}")
-        logger.info(f"  Avg R/trade     : {r.mean():+.4f}")
-        logger.info(f"  Median R        : {np.median(r):+.4f}")
-        logger.info(f"  Std Dev R       : {r.std():.4f}")
-        logger.info(f"  Best / Worst    : {r.max():+.4f}R  /  {r.min():+.4f}R")
-        logger.info(f"  Win rate        : {len(wins)/len(r):.1%}")
-        if len(wins):
-            logger.info(f"  Avg win R       : {wins['outcome_r'].mean():+.4f}")
-        if len(losses):
-            logger.info(f"  Avg loss R      : {losses['outcome_r'].mean():+.4f}")
-        if len(wins) and len(losses):
-            rr = abs(wins["outcome_r"].mean() / losses["outcome_r"].mean())
-            logger.info(f"  Win/Loss R ratio: {rr:.3f}")
-
-        # Rolling 7d
-        roll = df["rolling_7d_r"].dropna()
-        if len(roll):
-            logger.info(f"\n  {sep}")
-            logger.info(f"  ROLLING {self.rolling_days}-DAY AVG R")
-            logger.info(f"  {sep}")
-            logger.info(f"  Avg of rolling values : {roll.mean():+.4f}")
-            logger.info(f"  Range                 : {roll.min():+.4f}  to  {roll.max():+.4f}")
-
-        # Loss streaks
-        logger.info(f"\n  {sep}")
-        logger.info(f"  LOSS CLUSTER ANALYSIS")
-        logger.info(f"  {sep}")
-        if self._loss_streaks:
-            ls = np.array(self._loss_streaks)
-            logger.info(f"  Completed loss streaks : {len(ls)}")
-            logger.info(f"  Longest                : {ls.max()}")
-            logger.info(f"  Avg length             : {ls.mean():.2f}")
-            logger.info(f"  Streaks ≥3             : {(ls >= 3).sum()}")
-            logger.info(f"  Streaks ≥5             : {(ls >= 5).sum()}")
-        else:
-            logger.info("  No completed loss streaks detected.")
-
-        # Hour heatmap (compact)
-        logger.info(f"\n  {sep}")
-        logger.info(f"  LOSS HEATMAP — HOUR (UTC)")
-        logger.info(f"  {sep}")
-        hour_total = df.groupby("entry_hour_utc").size()
-        hour_loss  = losses.groupby("entry_hour_utc").size()
-        logger.info(f"  {'Hr':>3}  {'Tot':>5}  {'Los':>5}  {'LR':>7}  {'AvgR':>7}")
-        for h in sorted(set(hour_total.index) | set(hour_loss.index)):
-            tot  = hour_total.get(h, 0)
-            lss  = hour_loss.get(h, 0)
-            rate = lss / tot if tot else 0.0
-            avgr = df[df["entry_hour_utc"] == h]["outcome_r"].mean()
-            logger.info(f"  {h:>3}h  {tot:>5}  {lss:>5}  {rate:>6.1%}  {avgr:>+6.3f}")
-
-        # Monthly
-        logger.info(f"\n  {sep}")
-        logger.info(f"  MONTHLY BREAKDOWN")
-        logger.info(f"  {sep}")
-        df["ym"]     = df["trade_date"].dt.to_period("M")
-        mo_total     = df.groupby("ym").size()
-        mo_loss      = df[df["result"] == "L"].groupby("ym").size()
-        mo_avgr      = df.groupby("ym")["outcome_r"].mean()
-        mo_cumr      = df.groupby("ym")["outcome_r"].sum()
-        logger.info(f"  {'Month':<9}  {'Trd':>5}  {'Los':>5}  {'LR':>7}  {'AvgR':>7}  {'SumR':>8}")
-        for m in sorted(mo_total.index):
-            tot  = mo_total.get(m, 0)
-            lss  = mo_loss.get(m, 0)
-            rate = lss / tot if tot else 0.0
-            avgr = mo_avgr.get(m, float("nan"))
-            cumr = mo_cumr.get(m, float("nan"))
-            flag = "  ← worst" if not np.isnan(avgr) and avgr == mo_avgr.min() else ""
-            logger.info(f"  {str(m):<9}  {tot:>5}  {lss:>5}  {rate:>6.1%}  "
-                        f"{avgr:>+6.3f}  {cumr:>+7.3f}{flag}")
-
-        logger.info(f"\n{'='*78}\n")
 
 
 # ==============================================================================
@@ -692,11 +587,6 @@ def build_master_timeline(caches: dict) -> list:
             bar_close_ts = cache["times"][si] + _BAR_DURATION
             events.append((bar_close_ts, sym, si))
     events.sort(key=lambda x: x[0])
-    total_sigs = len(events)
-    syms_repr  = {sym: sum(1 for _, s, _ in events if s == sym)
-                  for sym in caches}
-    logger.info(f"  Timeline: {total_sigs:,} events  |  "
-                + "  ".join(f"{s}={v}" for s, v in syms_repr.items()))
     return events
 
 
@@ -729,8 +619,6 @@ def _entry_params(cache: dict, si: int):
 
     sl_mult = params["sl_range_mult"]
     sl_dist = max(sl_mult * or_size, atr * 0.05)
-    if sl_dist < 0.05 * atr:
-        sl_dist = 0.05 * atr
     if sl_dist <= 0:
         return None
 
@@ -744,7 +632,14 @@ def _entry_params(cache: dict, si: int):
 # ── MODE A: BE + ATR trail (original) ─────────────────────────────────────
 
 def resolve_mode_a(cache: dict, si: int):
-    """Original: BE at 1R then ATR trailing stop."""
+    """Original: BE at 1R then ATR trailing stop.
+
+    Spread handling (checked): longs buy at ask (spread added on entry only;
+    exit/stop sells at bid, no spread). Shorts sell at bid on entry (no
+    spread); exit/stop buys back at ask, so spread IS added on the exit side
+    (`bh + sp_bi >= cur_sl`). This mode was already symmetric — see Mode B
+    below for where the asymmetry bug actually was.
+    """
     ep_info = _entry_params(cache, si)
     if ep_info is None:
         return None, 0, 0.0, 0.0
@@ -825,6 +720,15 @@ def resolve_mode_b(cache: dict, si: int, rr_target: float,
     Fixed stop, single RR exit target.
     sl_multiplier=1.0  →  Mode B (normal SL)
     sl_multiplier=2.0  →  Mode C (wide SL)
+
+    FIX: the short-side take-profit check previously read `bl <= tp` with
+    no spread added. Closing a short means BUYING BACK, which fills at the
+    ask (bid + spread) — same reasoning already correctly applied to the
+    short stop-loss check two lines below. Without the spread term, short
+    TPs could fire on bars where the ask never actually reached the target,
+    silently inflating win rate / expectancy for every short trade in modes
+    B and C (this bug did not exist in Mode A, which never exits on a raw
+    TP touch).
     """
     ep_info = _entry_params(cache, si)
     if ep_info is None:
@@ -861,11 +765,11 @@ def resolve_mode_b(cache: dict, si: int, rr_target: float,
         bh, bl = h[bi], l[bi]
         sp_bi  = spread[bi]
 
-        # TP hit
+        # TP hit — FIXED: short TP must clear ask (bl + sp_bi), not raw bid low
         if direction == 1  and bh >= tp:
             outcome_r = rr_target
             exit_bar  = bi; closed = True; break
-        if direction == -1 and bl <= tp:
+        if direction == -1 and (bl + sp_bi) <= tp:
             outcome_r = rr_target
             exit_bar  = bi; closed = True; break
 
@@ -910,34 +814,24 @@ def compute_vol_max_cap(sl_dist, tick_value_per_lot, max_trades_per_day_combo):
     return round(cap, 8)
 
 
-# ── FIX: chronological entry/exit resolution ───────────────────────────────
-#
-# BUG (pre-fix): the old loop below processed signals in ENTRY order and
-# applied each trade's realized PnL to `balance` immediately, in that same
-# entry-order pass. That means position sizing for a later-ENTERED trade
-# could reflect the PnL of an earlier-ENTERED trade that, in real time,
-# hadn't actually EXITED yet (ORB holds can run up to MAX_HOLD=48 bars =
-# 4 hours, so overlap across symbols in multi-symbol combos is common).
-# The R-multiple of each trade (outcome_r) is unaffected — it only depends
-# on price action — so expectancy/win-rate/profit-factor stats computed
-# from per-trade R are unchanged. What's wrong is everything downstream of
-# lot sizing: final balance, drawdown, and (via lot-dependent daily-loss
-# breaches) the FTMO eval pass rate.
-#
-# FIX: resolve every trade's outcome up front (deterministic, balance-
-# independent), then replay a single merged timeline of ENTRY and EXIT
-# events in true chronological order. Lot size is computed at ENTRY time
-# using only the balance that has actually been realized (i.e. reflects
-# only trades that have already EXITED by that timestamp). PnL is applied
-# to `balance` only at EXIT time.
+# ── Chronological entry/exit resolution ─────────────────────────────────────
+# Every trade is pre-resolved (price-action only, balance-independent), then
+# replayed as a merged, true-chronological stream of ENTRY/EXIT events so
+# that lot sizing at ENTRY only ever reflects balance actually realized by
+# prior EXITS — never PnL from a trade still open in real time.
 
-def _resolve_all_trades(symbols: list, caches: dict, resolver_fn) -> list:
-    """Pre-resolve every signal's outcome (price-action only, no balance
-    dependency) and attach its entry/exit timestamps for chronological replay."""
+def _resolve_all_trades(symbols: list, caches: dict, resolver_fn,
+                         direction_filter: int = None) -> list:
+    """Pre-resolve every signal's outcome and attach entry/exit timestamps.
+
+    direction_filter: None = all signals, 1 = long-only, -1 = short-only.
+    """
     trades = []
     for sym in symbols:
         cache = caches[sym]
         for si in cache["signal_bars"]:
+            if direction_filter is not None and int(cache["signal"][si]) != direction_filter:
+                continue
             outcome_r, exit_bar, ep, sl_dist = resolver_fn(cache, si)
             if outcome_r is None:
                 continue
@@ -954,9 +848,7 @@ def _resolve_all_trades(symbols: list, caches: dict, resolver_fn) -> list:
 
 def _build_chrono_events(trades: list) -> list:
     """Merge entries and exits into one chronologically sorted event list.
-    On an exact timestamp tie, EXIT is processed before ENTRY so that a
-    trade closing at the same instant another opens never lets the new
-    entry see PnL from a trade that, mechanically, hadn't closed yet."""
+    On an exact timestamp tie, EXIT is processed before ENTRY."""
     events = []
     for idx, t in enumerate(trades):
         events.append((t["entry_time"], 1, idx))  # 1 = ENTRY
@@ -968,7 +860,8 @@ def _build_chrono_events(trades: list) -> list:
 def _run_simulation_core(combo_name: str, mode_label: str,
                           symbols: list, all_caches: dict,
                           tick_values: dict,
-                          resolver_fn) -> dict:
+                          resolver_fn,
+                          direction_filter: int = None) -> dict:
     """
     Generic simulation loop. resolver_fn(cache, si) → (outcome_r, exit_bar, ep, sl_dist).
     Returns a results dict + populated RTracker.
@@ -979,10 +872,8 @@ def _run_simulation_core(combo_name: str, mode_label: str,
     )
 
     caches = {sym: all_caches[sym] for sym in symbols}
-    # kept for the log line / event count parity with previous behaviour
-    build_master_timeline(caches)
 
-    trades = _resolve_all_trades(symbols, caches, resolver_fn)
+    trades = _resolve_all_trades(symbols, caches, resolver_fn, direction_filter)
     chrono = _build_chrono_events(trades)
 
     balance  = STARTING_BALANCE
@@ -1018,7 +909,8 @@ def _run_simulation_core(combo_name: str, mode_label: str,
         lot = st["lot"]
         outcome_r = t["outcome_r"]
 
-        pnl      = outcome_r * lot * sl_dist * tvpl
+        pnl  = outcome_r * lot * sl_dist * tvpl
+        pnl -= lot * COMMISSION_PER_LOT.get(sym, 0.0)   # round-turn commission
         balance += pnl
         peak_bal = max(peak_bal, balance)
         dd       = (peak_bal - balance) / peak_bal if peak_bal > 0 else 0.0
@@ -1053,7 +945,7 @@ def _run_simulation_core(combo_name: str, mode_label: str,
               if len(neg) and neg.sum() != 0 else 0.0
     ret     = (balance - STARTING_BALANCE) / STARTING_BALANCE
 
-    return {
+    result = {
         "combo":           combo_name,
         "mode":            mode_label,
         "symbols":         "+".join(symbols),
@@ -1066,7 +958,8 @@ def _run_simulation_core(combo_name: str, mode_label: str,
         "max_day_loss_pct": round(max_day_loss / STARTING_BALANCE * 100, 2),
         "return_pct":      round(ret * 100, 2),
         "final_balance":   round(balance, 2),
-    }, r_tracker
+    }
+    return result, r_tracker
 
 
 # ==============================================================================
@@ -1074,22 +967,31 @@ def _run_simulation_core(combo_name: str, mode_label: str,
 # ==============================================================================
 
 def run_combo_all_modes(combo_name: str, symbols: list,
-                         all_caches: dict, tick_values: dict,
-                         print_detailed_stats: bool = True) -> dict:
+                         all_caches: dict, tick_values: dict) -> dict:
     """
-    Runs Mode A, Mode B×RR_TARGETS, Mode C×RR_TARGETS for one combo.
-    Returns a summary dict with the 3-way comparison.
+    Runs Mode A, Mode A (long-only), Mode B×RR_TARGETS, Mode C×RR_TARGETS
+    for one combo. Returns a summary dict; no per-mode printing (see
+    SECTION 11 for the consolidated tables).
     """
     results_by_mode = {}
+    trackers_by_mode = {}
 
-    # ── Mode A: current (BE + trail) ─────────────────────────────────────
+    # ── Mode A: current (BE + trail), both directions ──────────────────────
     res_a, tracker_a = _run_simulation_core(
         combo_name, "A:BE+TRAIL", symbols, all_caches, tick_values,
         lambda cache, si: resolve_mode_a(cache, si)
     )
     results_by_mode["A:BE+TRAIL"] = res_a
-    if print_detailed_stats:
-        tracker_a.print_stats()
+    trackers_by_mode["A:BE+TRAIL"] = tracker_a
+
+    # ── Mode A, LONG ONLY ────────────────────────────────────────────────
+    res_a_long, tracker_a_long = _run_simulation_core(
+        combo_name, "A:LONG_ONLY", symbols, all_caches, tick_values,
+        lambda cache, si: resolve_mode_a(cache, si),
+        direction_filter=1,
+    )
+    results_by_mode["A:LONG_ONLY"] = res_a_long
+    trackers_by_mode["A:LONG_ONLY"] = tracker_a_long
 
     # ── Mode B: fixed SL + RR ladder ─────────────────────────────────────
     best_b = None
@@ -1101,8 +1003,7 @@ def run_combo_all_modes(combo_name: str, symbols: list,
                                                       sl_multiplier=1.0)
         )
         results_by_mode[label] = res
-        if print_detailed_stats:
-            tracker.print_stats()
+        trackers_by_mode[label] = tracker
         if best_b is None or res["expectancy_r"] > best_b["expectancy_r"]:
             best_b = res
 
@@ -1116,103 +1017,164 @@ def run_combo_all_modes(combo_name: str, symbols: list,
                                                       sl_multiplier=WIDE_SL_MULT)
         )
         results_by_mode[label] = res
-        if print_detailed_stats:
-            tracker.print_stats()
+        trackers_by_mode[label] = tracker
         if best_c is None or res["expectancy_r"] > best_c["expectancy_r"]:
             best_c = res
 
     return {
         "combo":          combo_name,
         "mode_A":         res_a,
+        "mode_A_long":    res_a_long,
         "best_B":         best_b,
         "best_C":         best_c,
         "all_modes":      results_by_mode,
+        "trackers":       trackers_by_mode,
     }
 
 
 # ==============================================================================
-#  SECTION 11 — COMPARISON PRINTER
+#  SECTION 11 — CONSOLIDATED SUMMARY TABLES  (replaces thousands of lines
+#               of per-trade / per-mode / per-cycle logging with 6 tables)
 # ==============================================================================
 
-def print_mode_comparison(all_combo_results: list) -> None:
-    sep = "=" * 118
+def _print_df(title: str, df: pd.DataFrame):
+    sep = "=" * max(60, len(title) + 4)
     logger.info(f"\n{sep}")
-    logger.info("  EXIT MODE COMPARISON — ALL COMBOS")
-    logger.info(f"  Mode A : BE at 1R then ATR trailing stop  (current)")
-    logger.info(f"  Mode B : Fixed SL, best RR target from {RR_TARGETS}  (normal SL)")
-    logger.info(f"  Mode C : Fixed SL ×{WIDE_SL_MULT}, best RR target from {RR_TARGETS}  (wide SL)")
+    logger.info(f"  {title}")
+    logger.info(sep)
+    logger.info(df.to_string(index=False))
     logger.info(sep)
 
-    hdr = (f"  {'Combo':<22}  {'Mode':<14}  {'Trd':>5}  {'WR':>6}  "
-           f"{'AvgR':>8}  {'PF':>6}  {'MDD%':>6}  {'DayLoss%':>9}  "
-           f"{'Ret%':>7}  {'FinalBal':>12}")
-    logger.info(hdr)
-    logger.info(f"  {'-'*114}")
 
-    def _row(combo_name, mode_res, marker=""):
-        mode  = mode_res["mode"]
-        trades = mode_res["trades"]
-        wr    = mode_res["win_rate"]
-        ex    = mode_res["expectancy_r"]
-        pf    = mode_res["profit_factor"]
-        mdd   = mode_res["mdd_pct"]
-        dl    = mode_res["max_day_loss_pct"]
-        ret   = mode_res["return_pct"]
-        bal   = mode_res["final_balance"]
-        mdd_flag = " ✓" if mdd < 10.0 else "  "
-        logger.info(
-            f"  {combo_name:<22}  {mode:<14}  {trades:>5}  {wr:>6.1%}  "
-            f"{ex:>+8.4f}  {pf:>6.3f}  {mdd:>5.2f}%  {dl:>8.2f}%  "
-            f"{ret:>+6.1f}%  ${bal:>11,.2f}{mdd_flag}{marker}"
-        )
-
+def build_table_exit_mode_comparison(all_combo_results: list) -> pd.DataFrame:
+    """TABLE 1 — Combo x Mode: trades, WR%, AvgR, PF, MDD%, Return%, Balance."""
+    rows = []
     for cr in all_combo_results:
-        combo_name = cr["combo"]
-        _row(combo_name, cr["mode_A"])
-        _row(combo_name, cr["best_B"], marker="  ← best B")
-        _row(combo_name, cr["best_C"], marker="  ← best C")
-        logger.info(f"  {'·'*114}")
+        for label, res in [("A:BE+TRAIL", cr["mode_A"]),
+                            ("A:LONG_ONLY", cr["mode_A_long"]),
+                            (cr["best_B"]["mode"] + " (best)", cr["best_B"]),
+                            (cr["best_C"]["mode"] + " (best)", cr["best_C"])]:
+            rows.append({
+                "Combo":    cr["combo"],
+                "Mode":     label,
+                "Trades":   res["trades"],
+                "WinRate%": round(res["win_rate"] * 100, 1),
+                "AvgR":     res["expectancy_r"],
+                "PF":       res["profit_factor"],
+                "MDD%":     res["mdd_pct"],
+                "Return%":  res["return_pct"],
+                "FinalBal": res["final_balance"],
+            })
+    return pd.DataFrame(rows)
 
-    # ── Winner per combo ──────────────────────────────────────────────────
-    logger.info(f"\n{sep}")
-    logger.info("  WINNER PER COMBO  (by expectancy R, then MDD tiebreak)")
-    logger.info(sep)
-    logger.info(f"  {'Combo':<22}  {'Winner':<14}  {'AvgR':>8}  "
-                f"{'WR':>6}  {'MDD%':>6}  {'Ret%':>7}  {'FinalBal':>12}")
-    logger.info(f"  {'-'*80}")
 
+def build_table_winner_per_combo(all_combo_results: list) -> pd.DataFrame:
+    """TABLE 2 — Best mode per combo by expectancy R (MDD tiebreak)."""
+    rows = []
     for cr in all_combo_results:
-        candidates = [cr["mode_A"], cr["best_B"], cr["best_C"]]
+        candidates = [cr["mode_A"], cr["mode_A_long"], cr["best_B"], cr["best_C"]]
         winner = max(candidates, key=lambda x: (x["expectancy_r"], -x["mdd_pct"]))
-        logger.info(
-            f"  {cr['combo']:<22}  {winner['mode']:<14}  "
-            f"{winner['expectancy_r']:>+8.4f}  {winner['win_rate']:>6.1%}  "
-            f"{winner['mdd_pct']:>5.2f}%  {winner['return_pct']:>+6.1f}%  "
-            f"${winner['final_balance']:>11,.2f}"
-        )
+        rows.append({
+            "Combo":    cr["combo"],
+            "Winner":   winner["mode"],
+            "AvgR":     winner["expectancy_r"],
+            "WinRate%": round(winner["win_rate"] * 100, 1),
+            "MDD%":     winner["mdd_pct"],
+            "Return%":  winner["return_pct"],
+            "FinalBal": winner["final_balance"],
+        })
+    return pd.DataFrame(rows)
 
-    # ── Full RR breakdown per combo ───────────────────────────────────────
-    logger.info(f"\n{sep}")
-    logger.info("  RR LADDER DETAIL — EXPECTANCY R BY COMBO × MODE")
-    logger.info(sep)
-    header = f"  {'Combo':<22}  {'Mode A':>10}"
-    for rr in RR_TARGETS:
-        header += f"  {'B:RR'+str(rr):>10}"
-    for rr in RR_TARGETS:
-        header += f"  {'C:RR'+str(rr):>11}"
-    logger.info(header)
-    logger.info(f"  {'-'*116}")
 
+def build_table_rr_ladder(all_combo_results: list) -> pd.DataFrame:
+    """TABLE 3 — Expectancy R by combo x RR rung, modes B and C."""
+    rows = []
     for cr in all_combo_results:
-        am    = cr["all_modes"]
-        row   = f"  {cr['combo']:<22}  {am['A:BE+TRAIL']['expectancy_r']:>+10.4f}"
+        am  = cr["all_modes"]
+        row = {"Combo": cr["combo"], "ModeA": am["A:BE+TRAIL"]["expectancy_r"],
+               "ModeA_Long": am["A:LONG_ONLY"]["expectancy_r"]}
         for rr in RR_TARGETS:
-            row += f"  {am[f'B:RR{rr}']['expectancy_r']:>+10.4f}"
+            row[f"B_RR{rr}"] = am[f"B:RR{rr}"]["expectancy_r"]
         for rr in RR_TARGETS:
-            row += f"  {am[f'C:WIDE_RR{rr}']['expectancy_r']:>+11.4f}"
-        logger.info(row)
+            row[f"C_RR{rr}"] = am[f"C:WIDE_RR{rr}"]["expectancy_r"]
+        rows.append(row)
+    return pd.DataFrame(rows)
 
-    logger.info(sep)
+
+def build_table_monthly(all_combo_results: list, mode_label: str) -> pd.DataFrame:
+    """TABLE — Monthly breakdown for one mode, aggregated across all combos
+    that include it. SumR is also shown as an approximate % of starting
+    balance (SumR x RISK_PER_TRADE x 100) — this is an approximation that
+    assumes each trade risked the standard RISK_PER_TRADE fraction; actual
+    compounding/lot-rounding will differ slightly from this figure."""
+    frames = []
+    for cr in all_combo_results:
+        tracker = cr["trackers"].get(mode_label)
+        if tracker is None or not tracker.trades:
+            continue
+        df = pd.DataFrame(tracker.trades)
+        df["combo"] = cr["combo"]
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["ym"] = df["trade_date"].dt.to_period("M")
+
+    out = (df.groupby(["combo", "ym"])
+             .agg(Trades=("outcome_r", "size"),
+                  WinRate=("result", lambda s: (s == "W").mean()),
+                  AvgR=("outcome_r", "mean"),
+                  SumR=("outcome_r", "sum"),
+                  PnL=("pnl", "sum"))
+             .reset_index())
+    out["WinRate%"]  = (out["WinRate"] * 100).round(1)
+    out["AvgR"]      = out["AvgR"].round(3)
+    out["SumR"]      = out["SumR"].round(2)
+    out["SumR_pct~"] = (out["SumR"] * RISK_PER_TRADE * 100).round(2)
+    out["PnL"]       = out["PnL"].round(2)
+    out["Month"]     = out["ym"].astype(str)
+    out = out[["combo", "Month", "Trades", "WinRate%", "AvgR", "SumR",
+               "SumR_pct~", "PnL"]]
+    out.columns = ["Combo", "Month", "Trades", "WinRate%", "AvgR", "SumR",
+                   "SumR_pct~", "PnL($)"]
+    return out.sort_values(["Combo", "Month"]).reset_index(drop=True)
+
+
+def build_table_ftmo_pass_rate(eval_summary: dict) -> pd.DataFrame:
+    """TABLE — FTMO eval pass rate (%) by combo x mode."""
+    rows = []
+    for combo_name, mode_rates in eval_summary.items():
+        row = {"Combo": combo_name}
+        row.update({m: r for m, r in mode_rates.items()})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def print_all_summary_tables(all_combo_results: list, eval_summary: dict):
+    _print_df("TABLE 1 — EXIT MODE COMPARISON (Combo x Mode)",
+              build_table_exit_mode_comparison(all_combo_results))
+
+    _print_df("TABLE 2 — WINNER PER COMBO (by expectancy R, MDD tiebreak)",
+              build_table_winner_per_combo(all_combo_results))
+
+    _print_df("TABLE 3 — RR LADDER DETAIL (expectancy R, Modes B/C)",
+              build_table_rr_ladder(all_combo_results))
+
+    monthly_a = build_table_monthly(all_combo_results, "A:BE+TRAIL")
+    if not monthly_a.empty:
+        _print_df("TABLE 4 — MONTHLY BREAKDOWN — Mode A (BE+TRAIL, both directions)",
+                  monthly_a)
+
+    monthly_a_long = build_table_monthly(all_combo_results, "A:LONG_ONLY")
+    if not monthly_a_long.empty:
+        _print_df("TABLE 5 — MONTHLY BREAKDOWN — Mode A LONG-ONLY",
+                  monthly_a_long)
+
+    if eval_summary:
+        _print_df("TABLE 6 — FTMO EVAL PASS RATE % (Combo x Mode)",
+                  build_table_ftmo_pass_rate(eval_summary))
 
 
 # ==============================================================================
@@ -1226,20 +1188,15 @@ EVAL_TOTAL_DD_LIM = 0.10
 EVAL_MIN_DAYS     = 4
 
 
-def run_eval_simulation(combo_name: str, symbols: list, events: list,
-                         caches: dict, tick_values: dict,
-                         resolver_fn=None) -> list:
+def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
+                         resolver_fn=None, direction_filter: int = None) -> list:
     """
     resolver_fn(cache, si) -> (outcome_r, exit_bar, ep, sl_dist).
     Defaults to resolve_mode_a (BE+trail) if not supplied.
 
-    FIX: same chronological entry/exit issue as _run_simulation_core (see
-    comment above that function). `events` here is entry-ordered only; we
-    pre-resolve every trade and replay a merged entry/exit timeline so lot
-    sizing at ENTRY only ever reflects balance that has actually been
-    realized at EXIT, never PnL from trades still open in real time.
-    `open_state` persists across phases/cycles so a trade opened near a
-    phase boundary still resolves its lot correctly when it exits later.
+    Uses the same chronological entry/exit replay as _run_simulation_core so
+    lot sizing at ENTRY only ever reflects balance actually realized by
+    prior EXITS.
     """
     if resolver_fn is None:
         resolver_fn = resolve_mode_a
@@ -1248,7 +1205,7 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
         PARAMS_GRID_BEST[s]["max_trades_day"] for s in symbols
     )
 
-    trades = _resolve_all_trades(symbols, caches, resolver_fn)
+    trades = _resolve_all_trades(symbols, caches, resolver_fn, direction_filter)
     chrono = _build_chrono_events(trades)
     open_state: dict = {}   # idx -> {"lot": float, "rejected": bool}  (persists across phases)
 
@@ -1260,8 +1217,6 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
         day_pnl: dict   = {}
         trading_days    = set()
         trade_count     = 0
-        start_date      = None
-        end_date        = None
 
         while event_idx[0] < len(chrono):
             t_time, etype, idx = chrono[event_idx[0]]
@@ -1272,25 +1227,23 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
             tvpl  = tick_values[sym]
             sl_dist = t["sl_dist"]
 
-            if etype == 1:  # ENTRY — size using balance realized so far
+            if etype == 1:  # ENTRY
                 vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day)
                 lot, _, _, _, rejected = compute_lot_aware(
                     balance, sl_dist, tvpl, vol_max_cap)
                 open_state[idx] = {"lot": lot, "rejected": rejected}
-                if start_date is None:
-                    start_date = cache["dates"][t["si"] + 1]
                 continue
 
-            # etype == 0: EXIT — realize PnL now
+            # etype == 0: EXIT
             st = open_state.get(idx)
             if st is None or st["rejected"]:
                 continue
             lot = st["lot"]
             outcome_r = t["outcome_r"]
 
-            pnl        = outcome_r * lot * sl_dist * tvpl
+            pnl  = outcome_r * lot * sl_dist * tvpl
+            pnl -= lot * COMMISSION_PER_LOT.get(sym, 0.0)
             trade_date = cache["dates"][t["si"] + 1]
-            end_date   = trade_date
 
             trading_days.add(trade_date)
             day_pnl[trade_date] = day_pnl.get(trade_date, 0.0) + pnl
@@ -1298,19 +1251,15 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
             trade_count += 1
 
             if day_pnl[trade_date] < -(phase_start_bal * EVAL_DAILY_LIMIT):
-                return (False, len(trading_days), trade_count,
-                        start_date, end_date, "DAILY_BREACH")
+                return False, len(trading_days), trade_count, "DAILY_BREACH"
 
             if balance < dd_floor:
-                return (False, len(trading_days), trade_count,
-                        start_date, end_date, "DD_BREACH")
+                return False, len(trading_days), trade_count, "DD_BREACH"
 
             if balance >= phase_target and len(trading_days) >= EVAL_MIN_DAYS:
-                return (True, len(trading_days), trade_count,
-                        start_date, end_date, "PASSED")
+                return True, len(trading_days), trade_count, "PASSED"
 
-        return (False, len(trading_days), trade_count,
-                start_date, end_date, "DATA_END")
+        return False, len(trading_days), trade_count, "DATA_END"
 
     balance   = STARTING_BALANCE
     event_idx = [0]
@@ -1319,93 +1268,26 @@ def run_eval_simulation(combo_name: str, symbols: list, events: list,
     while event_idx[0] < len(chrono):
         balance = STARTING_BALANCE
 
-        p1_pass, p1_days, p1_trades, p1_start, p1_end, p1_reason = \
-            run_phase(EVAL_P1_TARGET, event_idx)
+        p1_pass, p1_days, p1_trades, p1_reason = run_phase(EVAL_P1_TARGET, event_idx)
 
         if not p1_pass:
-            cycles.append({
-                "attempt":    len(cycles) + 1,
-                "result":     "FAIL",
-                "failed_at":  "P1",
-                "reason":     p1_reason,
-                "p1_days":    p1_days,
-                "p1_trades":  p1_trades,
-                "p2_days":    0,
-                "p2_trades":  0,
-                "total_days": p1_days,
-                "start_date": str(p1_start),
-                "end_date":   str(p1_end),
-            })
+            cycles.append({"result": "FAIL", "failed_at": "P1", "reason": p1_reason})
             continue
 
-        p2_pass, p2_days, p2_trades, p2_start, p2_end, p2_reason = \
-            run_phase(EVAL_P2_TARGET, event_idx)
+        p2_pass, p2_days, p2_trades, p2_reason = run_phase(EVAL_P2_TARGET, event_idx)
 
         cycles.append({
-            "attempt":    len(cycles) + 1,
-            "result":     "PASS" if p2_pass else "FAIL",
-            "failed_at":  "—"    if p2_pass else "P2",
-            "reason":     p2_reason,
-            "p1_days":    p1_days,
-            "p1_trades":  p1_trades,
-            "p2_days":    p2_days,
-            "p2_trades":  p2_trades,
-            "total_days": p1_days + p2_days,
-            "start_date": str(p1_start),
-            "end_date":   str(p2_end) if p2_end else str(p1_end),
+            "result":    "PASS" if p2_pass else "FAIL",
+            "failed_at": "—" if p2_pass else "P2",
+            "reason":    p2_reason,
         })
 
     return cycles
 
 
-def print_eval_results(combo_name: str, cycles: list,
-                        mode_label: str = "A:BE+TRAIL") -> None:
-    if not cycles:
-        logger.info(f"  [{combo_name} | {mode_label}] No eval cycles completed.")
-        return
-
-    total     = len(cycles)
-    passes    = sum(1 for c in cycles if c["result"] == "PASS")
-    fails     = total - passes
-    pass_rate = passes / total * 100
-
-    p1_fails = sum(1 for c in cycles if c["failed_at"] == "P1")
-    p2_fails = sum(1 for c in cycles if c["failed_at"] == "P2")
-    daily_br = sum(1 for c in cycles if c["reason"] == "DAILY_BREACH")
-    dd_br    = sum(1 for c in cycles if c["reason"] == "DD_BREACH")
-
-    pass_days = [c["total_days"] for c in cycles if c["result"] == "PASS"]
-    avg_days  = np.mean(pass_days) if pass_days else 0
-
-    sep = "=" * 90
-    logger.info(f"\n{sep}")
-    logger.info(f"  FTMO EVAL SIM — {combo_name}  [{mode_label}]")
-    logger.info(f"  Total attempts : {total}")
-    logger.info(f"  Passed         : {passes}  ({pass_rate:.1f}%)")
-    logger.info(f"  Failed         : {fails}  "
-                f"(P1={p1_fails}  P2={p2_fails}  "
-                f"DailyBreach={daily_br}  DDBreach={dd_br})")
-    logger.info(f"  Avg days to pass (passes only): {avg_days:.1f} trading days")
-    logger.info(f"\n  {'#':>4}  {'Result':<6}  {'FailAt':<6}  {'Reason':<14}"
-                f"  {'P1d':>4}  {'P1t':>4}  {'P2d':>4}  {'P2t':>4}"
-                f"  {'TotDays':>7}  Start        End")
-    logger.info(f"  {'-'*88}")
-    for c in cycles:
-        logger.info(
-            f"  {c['attempt']:>4}  {c['result']:<6}  {c['failed_at']:<6}  "
-            f"{c['reason']:<14}  {c['p1_days']:>4}  {c['p1_trades']:>4}  "
-            f"{c['p2_days']:>4}  {c['p2_trades']:>4}  "
-            f"{c['total_days']:>7}  {c['start_date']}  {c['end_date']}"
-        )
-    logger.info(sep)
-
-
 # ==============================================================================
 #  SECTION 13 — MAIN
 # ==============================================================================
-
-_GLOBAL_TRADE_LOG: list = []
-
 
 def main():
     if MT5_AVAILABLE:
@@ -1448,11 +1330,8 @@ def main():
         return
 
     logger.info(f"\n{'='*80}")
-    logger.info(f"  EXIT MODE SWEEP — {len(SYMBOL_COMBOS)} combos × "
-                f"{1 + 2*len(RR_TARGETS)} modes each")
-    logger.info(f"  Modes: A (current BE+trail)  |  "
-                f"B (fixed SL, RR {RR_TARGETS})  |  "
-                f"C (SL×{WIDE_SL_MULT}, RR {RR_TARGETS})")
+    logger.info(f"  EXIT MODE SWEEP — {len(SYMBOL_COMBOS)} combos x "
+                f"{2 + 2*len(RR_TARGETS)} modes each (incl. Mode A long-only)")
     logger.info(f"{'='*80}\n")
 
     all_combo_results = []
@@ -1462,54 +1341,37 @@ def main():
         if not all(s in all_caches for s in combo):
             continue
         combo_name = "+".join(combo)
-        logger.info(f"\n{'─'*60}")
-        logger.info(f"  COMBO: {combo_name}")
-        logger.info(f"{'─'*60}")
+        logger.info(f"  running combo: {combo_name} ...")
 
-        cr = run_combo_all_modes(
-            combo_name, list(combo), all_caches, tick_values,
-            print_detailed_stats=True,   # set False to suppress per-mode stat blocks
-        )
+        cr = run_combo_all_modes(combo_name, list(combo), all_caches, tick_values)
         all_combo_results.append(cr)
 
         for mode_label, res in cr["all_modes"].items():
             flat_rows.append(res)
 
-    # ── Comparison table ──────────────────────────────────────────────────
-    print_mode_comparison(all_combo_results)
-
-    # ── CSV outputs ───────────────────────────────────────────────────────
+    # ── CSV outputs (full data still saved, just not dumped to the log) ────
     pd.DataFrame(flat_rows).to_csv("orb_combo_sweep.csv", index=False)
-    logger.info("\n  orb_combo_sweep.csv written")
 
-    # ── FTMO eval — all combos × all exit modes ───────────────────────────
+    # ── FTMO eval — all combos x all exit modes (incl. Mode A long-only) ───
     eval_combos = [cr["combo"].split("+") for cr in all_combo_results]
 
-    # Build the full resolver map: label -> fn
-    eval_modes: dict = {"A:BE+TRAIL": resolve_mode_a}
+    eval_modes: dict = {
+        "A:BE+TRAIL":  (resolve_mode_a, None),
+        "A:LONG_ONLY": (resolve_mode_a, 1),
+    }
     for rr in RR_TARGETS:
-        eval_modes[f"B:RR{rr}"]      = (lambda _rr=rr:
-            lambda cache, si: resolve_mode_b(cache, si, _rr, sl_multiplier=1.0))()
-        eval_modes[f"C:WIDE_RR{rr}"] = (lambda _rr=rr:
-            lambda cache, si: resolve_mode_b(cache, si, _rr, sl_multiplier=WIDE_SL_MULT))()
+        eval_modes[f"B:RR{rr}"] = (
+            (lambda _rr=rr: lambda cache, si: resolve_mode_b(cache, si, _rr, sl_multiplier=1.0))(),
+            None,
+        )
+        eval_modes[f"C:WIDE_RR{rr}"] = (
+            (lambda _rr=rr: lambda cache, si: resolve_mode_b(cache, si, _rr, sl_multiplier=WIDE_SL_MULT))(),
+            None,
+        )
 
-    logger.info(f"\n{'='*90}")
-    logger.info(
-        f"  FTMO EVAL SIMULATION — {len(eval_combos)} combo(s) × "
-        f"{len(eval_modes)} modes"
-    )
-    logger.info(
-        f"  Modes: {', '.join(eval_modes.keys())}"
-    )
-    logger.info(
-        f"  P1 target=+10%  P2 target=+5%  "
-        f"DailyLimit={EVAL_DAILY_LIMIT:.2%}  TotalDD={EVAL_TOTAL_DD_LIM:.0%}  "
-        f"MinDays={EVAL_MIN_DAYS}"
-    )
-    logger.info(f"{'='*90}")
+    logger.info(f"\n  running FTMO eval sims — {len(eval_combos)} combo(s) x {len(eval_modes)} modes ...")
 
     all_eval_cycles = []
-    # eval_summary[combo_name][mode_label] = pass_rate
     eval_summary: dict = {}
 
     for symbols in eval_combos:
@@ -1520,56 +1382,32 @@ def main():
             continue
 
         caches = {sym: all_caches[sym] for sym in symbols}
-        events = build_master_timeline(caches)
-        logger.info(f"\n  [{combo_name}] {len(events):,} signal events")
-
         eval_summary[combo_name] = {}
 
-        for mode_label, resolver_fn in eval_modes.items():
+        for mode_label, (resolver_fn, direction_filter) in eval_modes.items():
             cycles = run_eval_simulation(
-                combo_name, symbols, events, caches, tick_values,
-                resolver_fn=resolver_fn,
+                symbols, caches, tick_values,
+                resolver_fn=resolver_fn, direction_filter=direction_filter,
             )
-            print_eval_results(combo_name, cycles, mode_label=mode_label)
-
             total  = len(cycles)
             passes = sum(1 for c in cycles if c["result"] == "PASS")
             eval_summary[combo_name][mode_label] = (
                 round(passes / total * 100, 1) if total else 0.0
             )
-
             for c in cycles:
                 c["combo"] = combo_name
                 c["mode"]  = mode_label
             all_eval_cycles.extend(cycles)
 
     pd.DataFrame(all_eval_cycles).to_csv("orb_eval_cycles.csv", index=False)
-    logger.info("\n  orb_eval_cycles.csv written")
 
-    # ── FTMO eval pass-rate summary table ─────────────────────────────────
-    mode_labels = list(eval_modes.keys())
-    sep = "=" * (24 + 9 * len(mode_labels))
-    logger.info(f"\n{sep}")
-    logger.info("  FTMO EVAL PASS RATE SUMMARY  (%)")
-    logger.info(sep)
-    hdr = f"  {'Combo':<22}" + "".join(f"  {m:>10}" for m in mode_labels)
-    logger.info(hdr)
-    logger.info(f"  {'-'*(22 + 12*len(mode_labels))}")
-    for combo_name, mode_rates in eval_summary.items():
-        row = f"  {combo_name:<22}"
-        best_rate = max(mode_rates.values()) if mode_rates else 0
-        for m in mode_labels:
-            rate = mode_rates.get(m, 0.0)
-            flag = " ←" if rate == best_rate and best_rate > 0 else "  "
-            row += f"  {rate:>8.1f}%{flag[0]}"
-        logger.info(row)
-    logger.info(sep)
-    logger.info("  ← marks the highest pass rate per combo")
+    # ── The only console/log output now: 6 consolidated tables ─────────────
+    print_all_summary_tables(all_combo_results, eval_summary)
 
     logger.info(
         "\nOutputs saved:\n"
-        "  orb_combo_sweep.csv\n"
-        "  orb_eval_cycles.csv\n"
+        "  orb_combo_sweep.csv   (full per-mode combo results)\n"
+        "  orb_eval_cycles.csv   (every FTMO eval attempt)\n"
         "  orb_chrono_compare.log\n"
         "Done."
     )
