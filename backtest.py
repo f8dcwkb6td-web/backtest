@@ -273,6 +273,33 @@ def resolve_symbol(canonical: str):
     return None
 
 
+def _calibrate_effective_leverage(broker_sym: str, contract_size: float):
+    """
+    account_info().leverage is a nominal/max account figure. Many brokers
+    (this one included, per the user: 1:20 for indices, 1:200 for FX on the
+    SAME account) apply a lower effective leverage per instrument class on
+    top of it. Using the flat account leverage for margin math on an index
+    understates required margin — exactly the bug that made the backtest's
+    margin-downsize never fire while the live engine's real margin math did.
+
+    Calibrate the REAL effective leverage the same way live effectively
+    experiences it: call order_calc_margin() (the same function
+    execute_entry() calls on every live order) once at the current price for
+    a reference 1.0 lot, then back out the leverage implied by that margin.
+    This is assumed stable over the backtest window (leverage tiers don't
+    change bar to bar).
+    """
+    tick = mt5.symbol_info_tick(broker_sym)
+    if tick is None or tick.ask <= 0:
+        return None
+    price = tick.ask
+    test_lot = 1.0
+    margin = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, broker_sym, test_lot, price)
+    if margin is None or margin <= 0:
+        return None
+    return (test_lot * contract_size * price) / margin
+
+
 def fetch_broker_info() -> tuple:
     """
     Mirrors the live engine's `_tick_info` build-up in run_live() plus its
@@ -281,20 +308,26 @@ def fetch_broker_info() -> tuple:
     downsize (execute_entry's MD-1 patch) that the live engine actually
     enforces. Without this, the backtest silently assumes zero stop-distance
     floor and infinite margin — both optimistic relative to live.
+
+    Leverage is calibrated PER SYMBOL via order_calc_margin (see
+    _calibrate_effective_leverage) rather than using the flat account-wide
+    leverage, since instrument classes (indices vs FX) can have different
+    effective leverage on the same account.
     """
     info_out: dict = {}
-    leverage = ACCOUNT_LEVERAGE_FALLBACK
+    account_leverage = ACCOUNT_LEVERAGE_FALLBACK
 
     if MT5_AVAILABLE:
         acct = mt5.account_info()
         if acct is not None and acct.leverage:
-            leverage = float(acct.leverage)
+            account_leverage = float(acct.leverage)
 
     for canon in SYMBOLS:
         entry = {
             "tvpl":            TICK_VALUE_FALLBACK.get(canon, 1.0),
             "min_sl_distance": 0.0,
             "contract_size":   CONTRACT_SIZE_FALLBACK,
+            "leverage":        account_leverage,   # placeholder until calibrated below
         }
         if MT5_AVAILABLE:
             broker = resolve_symbol(canon)
@@ -314,13 +347,29 @@ def fetch_broker_info() -> tuple:
                     entry["contract_size"] = (sinfo.trade_contract_size
                                                if sinfo.trade_contract_size > 0
                                                else CONTRACT_SIZE_FALLBACK)
+
+                    calibrated = _calibrate_effective_leverage(broker, entry["contract_size"])
+                    if calibrated is not None and calibrated > 0:
+                        entry["leverage"] = calibrated
+                        if abs(calibrated - account_leverage) > 1.0:
+                            logger.warning(
+                                f"  [{canon}] EFFECTIVE leverage 1:{calibrated:.1f} "
+                                f"differs from account leverage 1:{account_leverage:.0f} "
+                                f"— using the calibrated per-symbol value for margin math"
+                            )
+                    else:
+                        logger.warning(f"  [{canon}] leverage calibration failed "
+                                       f"(no tick/margin calc) — using account "
+                                       f"leverage 1:{account_leverage:.0f} as fallback")
         info_out[canon] = entry
         logger.info(f"  [{canon}] tvpl={entry['tvpl']:.6f}  "
                     f"min_sl_dist={entry['min_sl_distance']:.5f}  "
-                    f"contract_size={entry['contract_size']:.2f}")
+                    f"contract_size={entry['contract_size']:.2f}  "
+                    f"leverage=1:{entry['leverage']:.1f}")
 
-    logger.info(f"  Account leverage: 1:{leverage:.0f}")
-    return info_out, leverage
+    logger.info(f"  Account-wide leverage (nominal, NOT used for margin math): "
+                f"1:{account_leverage:.0f}")
+    return info_out, account_leverage
 
 
 def _last_closed_bar_open_time() -> datetime.datetime:
@@ -922,7 +971,7 @@ def _check_margin_and_downsize(lot: float, sl_dist: float, ep: float,
 
 def _run_simulation_core(combo_name: str, mode_label: str,
                           symbols: list, all_caches: dict,
-                          broker_info: dict, account_leverage: float,
+                          broker_info: dict,
                           resolver_fn,
                           direction_filter: int = None) -> dict:
     """
@@ -977,8 +1026,9 @@ def _run_simulation_core(combo_name: str, mode_label: str,
             downsized = False
             if not rejected:
                 free_margin = balance - used_margin
+                sym_leverage = broker_info[sym]["leverage"]
                 new_lot, margin_used_now, downsized = _check_margin_and_downsize(
-                    lot, sl_dist, ep, contract_size, account_leverage,
+                    lot, sl_dist, ep, contract_size, sym_leverage,
                     free_margin, vol_max_cap
                 )
                 if new_lot is None:
@@ -1066,20 +1116,19 @@ def _run_simulation_core(combo_name: str, mode_label: str,
 # ==============================================================================
 
 def run_combo_all_modes(combo_name: str, symbols: list,
-                         all_caches: dict, broker_info: dict,
-                         account_leverage: float) -> dict:
+                         all_caches: dict, broker_info: dict) -> dict:
     results_by_mode = {}
     trackers_by_mode = {}
 
     res_a, tracker_a = _run_simulation_core(
-        combo_name, "A:BE+TRAIL", symbols, all_caches, broker_info, account_leverage,
+        combo_name, "A:BE+TRAIL", symbols, all_caches, broker_info,
         lambda cache, si: resolve_mode_a(cache, si)
     )
     results_by_mode["A:BE+TRAIL"] = res_a
     trackers_by_mode["A:BE+TRAIL"] = tracker_a
 
     res_a_long, tracker_a_long = _run_simulation_core(
-        combo_name, "A:LONG_ONLY", symbols, all_caches, broker_info, account_leverage,
+        combo_name, "A:LONG_ONLY", symbols, all_caches, broker_info,
         lambda cache, si: resolve_mode_a(cache, si),
         direction_filter=1,
     )
@@ -1090,7 +1139,7 @@ def run_combo_all_modes(combo_name: str, symbols: list,
     for rr in RR_TARGETS:
         label = f"B:RR{rr}"
         res, tracker = _run_simulation_core(
-            combo_name, label, symbols, all_caches, broker_info, account_leverage,
+            combo_name, label, symbols, all_caches, broker_info,
             lambda cache, si, _rr=rr: resolve_mode_b(cache, si, _rr,
                                                       sl_multiplier=1.0)
         )
@@ -1103,7 +1152,7 @@ def run_combo_all_modes(combo_name: str, symbols: list,
     for rr in RR_TARGETS:
         label = f"C:WIDE_RR{rr}"
         res, tracker = _run_simulation_core(
-            combo_name, label, symbols, all_caches, broker_info, account_leverage,
+            combo_name, label, symbols, all_caches, broker_info,
             lambda cache, si, _rr=rr: resolve_mode_b(cache, si, _rr,
                                                       sl_multiplier=WIDE_SL_MULT)
         )
@@ -1272,7 +1321,6 @@ EVAL_MIN_DAYS     = 4
 
 
 def run_eval_simulation(symbols: list, caches: dict, broker_info: dict,
-                         account_leverage: float,
                          resolver_fn=None, direction_filter: int = None) -> list:
     if resolver_fn is None:
         resolver_fn = resolve_mode_a
@@ -1314,8 +1362,9 @@ def run_eval_simulation(symbols: list, caches: dict, broker_info: dict,
                 margin_used_now = 0.0
                 if not rejected:
                     free_margin = balance - used_margin_holder[0]
+                    sym_leverage = broker_info[sym]["leverage"]
                     new_lot, margin_used_now, _ = _check_margin_and_downsize(
-                        lot, sl_dist, ep, contract_size, account_leverage,
+                        lot, sl_dist, ep, contract_size, sym_leverage,
                         free_margin, vol_max_cap
                     )
                     if new_lot is None:
@@ -1485,8 +1534,7 @@ def main():
         combo_name = "+".join(combo)
         logger.info(f"  running combo: {combo_name} ...")
 
-        cr = run_combo_all_modes(combo_name, list(combo), all_caches,
-                                  broker_info, account_leverage)
+        cr = run_combo_all_modes(combo_name, list(combo), all_caches, broker_info)
         all_combo_results.append(cr)
 
         for mode_label, res in cr["all_modes"].items():
@@ -1527,7 +1575,7 @@ def main():
 
         for mode_label, (resolver_fn, direction_filter) in eval_modes.items():
             cycles = run_eval_simulation(
-                symbols, caches, broker_info, account_leverage,
+                symbols, caches, broker_info,
                 resolver_fn=resolver_fn, direction_filter=direction_filter,
             )
             total  = len(cycles)
