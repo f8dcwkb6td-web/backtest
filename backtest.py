@@ -1398,6 +1398,43 @@ def main():
                               password=PASSWORD, server=SERVER):
             raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
         logger.info("MT5 connected")
+
+        # ── ACCOUNT IDENTITY CHECK ──────────────────────────────────────
+        # LOGIN/PASSWORD/SERVER above come from MT5_LOGIN/MT5_PASSWORD/
+        # MT5_SERVER env vars, defaulting to 0/""/"" if unset — unlike the
+        # live engine (orb_live_v6.py), which hardcodes the real account.
+        # If those env vars weren't set, this may have silently attached
+        # to whatever account the terminal already had open, NOT your real
+        # FundingPips account — which would make every account-derived
+        # number below (leverage, margin, stops level, even price/spread
+        # feed) come from the wrong source. Verify this line matches your
+        # live engine's LOGIN=20051742 / SERVER="FundingPips-SIM1" exactly.
+        _acct = mt5.account_info()
+        if _acct is not None:
+            logger.info(
+                f"  *** CONNECTED ACCOUNT: login={_acct.login}  "
+                f"server={_acct.server!r}  leverage=1:{_acct.leverage}  "
+                f"balance={_acct.balance:.2f}  currency={_acct.currency} ***"
+            )
+            if LOGIN and _acct.login != LOGIN:
+                logger.error(
+                    f"  *** MISMATCH: requested LOGIN={LOGIN} but connected "
+                    f"account is {_acct.login} — env var MT5_LOGIN likely "
+                    f"unset/wrong. Backtest is NOT using your real account. ***"
+                )
+            if not LOGIN:
+                logger.warning(
+                    "  *** MT5_LOGIN env var was unset (LOGIN=0) — backtest "
+                    "attached to whatever account the terminal already had "
+                    "open, which may not be your FundingPips-SIM1 account. "
+                    "Set MT5_LOGIN / MT5_PASSWORD / MT5_SERVER to match the "
+                    "live engine, or hardcode them the same way orb_live_v6.py "
+                    "does. ***"
+                )
+        else:
+            logger.error("  *** account_info() returned None — could not "
+                         "verify which account this backtest is connected to ***")
+        # ─────────────────────────────────────────────────────────────────
     else:
         logger.warning("MT5 not available — using fallback broker info")
 
