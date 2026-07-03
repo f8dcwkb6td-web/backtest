@@ -137,6 +137,23 @@ WIDE_SL_MULT = 2.0
 DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
 
+# ── Trade-start cutoff ───────────────────────────────────────────────────────
+# Restricts signal/trade generation to bars ON OR AFTER this date, while
+# STILL using the full fetched history (CSV prefix + all MT5 bars before
+# this date) to warm up ATR and the ATR-percentile filter — indicators are
+# not cold-started, they carry the same "memory" they would have had live.
+# Set to None to disable (falls back to the full MT5 signal window).
+TRADE_START_DATE = "2026-06-04"
+
+# IMPORTANT for this run: STARTING_BALANCE above is used as the equity
+# curve's starting point. If your live account balance on TRADE_START_DATE
+# was different (e.g. grown from a prior profitable run), set
+# STARTING_BALANCE to that actual figure before running — position sizing
+# is NOT simply proportional to balance because of the VOL_MIN=0.10 lot
+# floor and MAX_RISK_MULTIPLE rejection threshold (see compute_lot_aware).
+# A backtest starting fresh at the wrong balance can take a different set
+# of trades, at different effective risk, than what actually happened live.
+
 
 # ==============================================================================
 #  SECTION 0 — R STATS (lean — collects trades, no verbose per-mode dumps)
@@ -472,6 +489,12 @@ def build_cache_and_signals(canonical: str, df_all: pd.DataFrame,
 
     in_signal_window = df_all["time_utc"].values >= np.datetime64(mt5_start)
 
+    if TRADE_START_DATE is not None:
+        trade_start_ts = np.datetime64(pd.Timestamp(TRADE_START_DATE))
+        in_trade_window = df_all["time_utc"].values >= trade_start_ts
+    else:
+        in_trade_window = np.ones(n, dtype=bool)
+
     in_session = np.array([
         (utc_h[i] > cfg["open_h"] or
          (utc_h[i] == cfg["open_h"] and utc_m[i] >= cfg["open_m"]))
@@ -516,7 +539,8 @@ def build_cache_and_signals(canonical: str, df_all: pd.DataFrame,
 
     base = (in_session & atr_ok & valid
             & ~np.isnan(or_high)
-            & in_signal_window)
+            & in_signal_window
+            & in_trade_window)
     body = np.abs(c - o)
 
     breaks_up   = base & (c > or_high)
@@ -549,10 +573,14 @@ def build_cache_and_signals(canonical: str, df_all: pd.DataFrame,
 
     n_csv_pre = int((~in_signal_window).sum())
     n_mt5     = int(in_signal_window.sum())
+    trade_window_note = (
+        f"  trade-start={TRADE_START_DATE}"
+        if TRADE_START_DATE is not None else ""
+    )
     logger.info(
         f"  [{canonical}] signals={len(signal_bars):,}  "
         f"ATR-prefix={n_csv_pre:,}  MT5-window={n_mt5:,}  "
-        f"n_weeks={n_mt5 / (12 * 24 * 5):.1f}"
+        f"n_weeks={n_mt5 / (12 * 24 * 5):.1f}{trade_window_note}"
     )
 
     return {
@@ -1290,6 +1318,16 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
 # ==============================================================================
 
 def main():
+    logger.info(f"\n{'='*80}")
+    logger.info(f"  RUN CONFIG")
+    logger.info(f"  Starting balance : ${STARTING_BALANCE:,.2f}"
+                f"  (set this to your actual live balance on"
+                f" TRADE_START_DATE for a representative comparison)")
+    logger.info(f"  Trade start date : {TRADE_START_DATE!r}"
+                f"  (ATR/indicators still warm up on full prior history)")
+    logger.info(f"  Commission/lot   : {COMMISSION_PER_LOT}")
+    logger.info(f"{'='*80}\n")
+
     if MT5_AVAILABLE:
         if not mt5.initialize(path=TERMINAL_PATH, login=LOGIN,
                               password=PASSWORD, server=SERVER):
