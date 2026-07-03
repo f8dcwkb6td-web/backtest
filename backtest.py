@@ -104,58 +104,66 @@ def parse_log(path: str, from_date: str = None):
     }
 
 
-def print_summary(result: dict):
+def build_summary_text(result: dict) -> str:
     c = result["counts"]
     sig = c.get("signals_fired", 0)
     ent = c.get("entries_confirmed", 0)
     gap = sig - ent
 
-    print("=" * 60)
-    print("  ORB LIVE LOG SUMMARY")
-    print("=" * 60)
-    print(f"  Signals fired            : {sig}")
-    print(f"  Entries confirmed         : {ent}")
-    print(f"  Signals -> no position    : {gap}"
-          f"  ({gap/sig*100:.1f}% of signals)" if sig else "")
-    print("-" * 60)
-    print(f"  retcode 10016 occurrences : {c.get('retcode_10016', 0)}")
-    print(f"  Entries dropped entirely  : {c.get('entries_dropped_entirely', 0)}"
-          f"   <- trade never happened, 3 retries exhausted")
-    print(f"  Margin downsizes          : {c.get('margin_downsizes', 0)}"
-          f"   <- trade happened, but smaller lot than risk model wanted")
-    print(f"  Margin rejects (hard)     : {c.get('margin_rejects', 0)}")
-    print("-" * 60)
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  ORB LIVE LOG SUMMARY")
+    lines.append("=" * 60)
+    lines.append(f"  Signals fired            : {sig}")
+    lines.append(f"  Entries confirmed         : {ent}")
+    if sig:
+        lines.append(f"  Signals -> no position    : {gap}"
+                      f"  ({gap/sig*100:.1f}% of signals)")
+    lines.append("-" * 60)
+    lines.append(f"  retcode 10016 occurrences : {c.get('retcode_10016', 0)}")
+    lines.append(f"  Entries dropped entirely  : {c.get('entries_dropped_entirely', 0)}"
+                 f"   <- trade never happened, 3 retries exhausted")
+    lines.append(f"  Margin downsizes          : {c.get('margin_downsizes', 0)}"
+                 f"   <- trade happened, but smaller lot than risk model wanted")
+    lines.append(f"  Margin rejects (hard)     : {c.get('margin_rejects', 0)}")
+    lines.append("-" * 60)
 
     if result["downsize_lots"]:
         avg_down = sum(result["downsize_lots"]) / len(result["downsize_lots"])
-        print(f"  Avg lot on downsized trades : {avg_down:.3f}")
+        lines.append(f"  Avg lot on downsized trades : {avg_down:.3f}")
     if result["all_entry_lots"]:
         avg_all = sum(result["all_entry_lots"]) / len(result["all_entry_lots"])
-        print(f"  Avg lot across ALL entries  : {avg_all:.3f}")
+        lines.append(f"  Avg lot across ALL entries  : {avg_all:.3f}")
     if result["downsize_lots"] and result["all_entry_lots"]:
         avg_down = sum(result["downsize_lots"]) / len(result["downsize_lots"])
         avg_all  = sum(result["all_entry_lots"]) / len(result["all_entry_lots"])
         if avg_all > 0:
             shortfall = (1 - avg_down / avg_all) * 100
-            print(f"  -> downsized trades average ~{shortfall:.0f}% smaller lot"
-                  f" than a typical entry")
-    print("-" * 60)
+            lines.append(f"  -> downsized trades average ~{shortfall:.0f}% smaller lot"
+                         f" than a typical entry")
+    lines.append("-" * 60)
 
     if result["bt_accuracy"]:
-        print("  BT accuracy at startup (per symbol):")
+        lines.append("  BT accuracy at startup (per symbol):")
         for sym, acc in result["bt_accuracy"].items():
             flag = "" if acc >= 95.0 else "  <- BELOW 95% THRESHOLD"
-            print(f"    {sym:<8} {acc:.2f}%{flag}")
-    print("-" * 60)
+            lines.append(f"    {sym:<8} {acc:.2f}%{flag}")
+    lines.append("-" * 60)
 
-    print("  Per-symbol signal -> entry conversion:")
+    lines.append("  Per-symbol signal -> entry conversion:")
     all_syms = set(result["per_symbol_signals"]) | set(result["per_symbol_entries"])
     for sym in sorted(all_syms):
         s = result["per_symbol_signals"].get(sym, 0)
         e = result["per_symbol_entries"].get(sym, 0)
         pct = (e / s * 100) if s else 0.0
-        print(f"    {sym:<8} signals={s:<5} entries={e:<5} ({pct:.1f}% converted)")
-    print("=" * 60)
+        lines.append(f"    {sym:<8} signals={s:<5} entries={e:<5} ({pct:.1f}% converted)")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
+
+
+def print_summary(result: dict):
+    print(build_summary_text(result))
 
 
 if __name__ == "__main__":
@@ -163,7 +171,18 @@ if __name__ == "__main__":
     ap.add_argument("logfile")
     ap.add_argument("--from", dest="from_date", default=None,
                      help="Only count lines from this ISO date onward, e.g. 2026-06-04")
+    ap.add_argument("--out", dest="out_path", default=None,
+                     help="Where to write the summary file "
+                          "(default: <logfile>_summary.txt next to the log)")
     args = ap.parse_args()
 
     result = parse_log(args.logfile, args.from_date)
-    print_summary(result)
+    summary_text = build_summary_text(result)
+
+    print(summary_text)
+
+    out_path = args.out_path or (args.logfile.rsplit(".", 1)[0] + "_summary.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(summary_text + "\n")
+
+    print(f"\nSummary written to: {out_path}")
