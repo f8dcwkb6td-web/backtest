@@ -84,6 +84,11 @@ TICK_VALUE_FALLBACK = {
     "GER40": 1.0,
 }
 
+# Fallbacks used only when MT5 / symbol_info is unavailable at fetch time.
+MIN_SL_DISTANCE_FALLBACK_PTS = 5.0     # broker "stops level" fallback
+CONTRACT_SIZE_FALLBACK       = 1.0
+ACCOUNT_LEVERAGE_FALLBACK    = 100.0
+
 # ── Strategy constants ──────────────────────────────────────────────────────
 FETCH_BARS_M5  = 140_000
 M5_SECONDS     = 300
@@ -138,21 +143,7 @@ DAILY_LOSS_CAP_PCT = 0.0475
 DAILY_LOSS_BUDGET  = STARTING_BALANCE * DAILY_LOSS_CAP_PCT
 
 # ── Trade-start cutoff ───────────────────────────────────────────────────────
-# Restricts signal/trade generation to bars ON OR AFTER this date, while
-# STILL using the full fetched history (CSV prefix + all MT5 bars before
-# this date) to warm up ATR and the ATR-percentile filter — indicators are
-# not cold-started, they carry the same "memory" they would have had live.
-# Set to None to disable (falls back to the full MT5 signal window).
 TRADE_START_DATE = "2026-06-04"
-
-# IMPORTANT for this run: STARTING_BALANCE above is used as the equity
-# curve's starting point. If your live account balance on TRADE_START_DATE
-# was different (e.g. grown from a prior profitable run), set
-# STARTING_BALANCE to that actual figure before running — position sizing
-# is NOT simply proportional to balance because of the VOL_MIN=0.10 lot
-# floor and MAX_RISK_MULTIPLE rejection threshold (see compute_lot_aware).
-# A backtest starting fresh at the wrong balance can take a different set
-# of trades, at different effective risk, than what actually happened live.
 
 
 # ==============================================================================
@@ -160,11 +151,6 @@ TRADE_START_DATE = "2026-06-04"
 # ==============================================================================
 
 class RTracker:
-    """
-    Accumulates trade records silently. No per-mode printing — all reporting
-    now happens through the consolidated tables built in SECTION 11.
-    """
-
     def __init__(self, combo_name: str, mode_label: str,
                  rolling_days: int = ROLLING_R_DAYS):
         self.combo        = combo_name
@@ -287,27 +273,54 @@ def resolve_symbol(canonical: str):
     return None
 
 
-def fetch_tick_values() -> dict:
-    tvpl = {}
+def fetch_broker_info() -> tuple:
+    """
+    Mirrors the live engine's `_tick_info` build-up in run_live() plus its
+    account leverage, so the backtest can apply the SAME broker-minimum-stop
+    clamp (clamp_sl / get_min_sl_distance) and the SAME margin-based lot
+    downsize (execute_entry's MD-1 patch) that the live engine actually
+    enforces. Without this, the backtest silently assumes zero stop-distance
+    floor and infinite margin — both optimistic relative to live.
+    """
+    info_out: dict = {}
+    leverage = ACCOUNT_LEVERAGE_FALLBACK
+
+    if MT5_AVAILABLE:
+        acct = mt5.account_info()
+        if acct is not None and acct.leverage:
+            leverage = float(acct.leverage)
+
     for canon in SYMBOLS:
-        fallback = TICK_VALUE_FALLBACK.get(canon, 1.0)
-        if not MT5_AVAILABLE:
-            tvpl[canon] = fallback
-            continue
-        broker = resolve_symbol(canon)
-        if broker is None:
-            tvpl[canon] = fallback
-            logger.warning(f"  [{canon}] not found — fallback tv={fallback}")
-            continue
-        info = mt5.symbol_info(broker)
-        if info is None or info.trade_tick_size <= 0:
-            tvpl[canon] = fallback
-            logger.warning(f"  [{canon}] info invalid — fallback tv={fallback}")
-            continue
-        tv = info.trade_tick_value / info.trade_tick_size
-        tvpl[canon] = tv
-        logger.info(f"  [{canon}] broker={broker} tick_val/lot={tv:.6f}")
-    return tvpl
+        entry = {
+            "tvpl":            TICK_VALUE_FALLBACK.get(canon, 1.0),
+            "min_sl_distance": 0.0,
+            "contract_size":   CONTRACT_SIZE_FALLBACK,
+        }
+        if MT5_AVAILABLE:
+            broker = resolve_symbol(canon)
+            if broker is None:
+                logger.warning(f"  [{canon}] not found — using fallback broker info")
+            else:
+                sinfo = mt5.symbol_info(broker)
+                if sinfo is None or sinfo.trade_tick_size <= 0:
+                    logger.warning(f"  [{canon}] symbol_info invalid — using fallback")
+                else:
+                    entry["tvpl"] = sinfo.trade_tick_value / sinfo.trade_tick_size
+                    point   = sinfo.point if sinfo.point > 0 else 0.0001
+                    sl_lvl  = int(sinfo.trade_stops_level or 0)
+                    fallback_dist = MIN_SL_DISTANCE_FALLBACK_PTS * point
+                    entry["min_sl_distance"] = (max(sl_lvl * point, fallback_dist)
+                                                 if sl_lvl > 0 else fallback_dist)
+                    entry["contract_size"] = (sinfo.trade_contract_size
+                                               if sinfo.trade_contract_size > 0
+                                               else CONTRACT_SIZE_FALLBACK)
+        info_out[canon] = entry
+        logger.info(f"  [{canon}] tvpl={entry['tvpl']:.6f}  "
+                    f"min_sl_dist={entry['min_sl_distance']:.5f}  "
+                    f"contract_size={entry['contract_size']:.2f}")
+
+    logger.info(f"  Account leverage: 1:{leverage:.0f}")
+    return info_out, leverage
 
 
 def _last_closed_bar_open_time() -> datetime.datetime:
@@ -466,7 +479,8 @@ def expanding_pct_rank(arr):
 # ==============================================================================
 
 def build_cache_and_signals(canonical: str, df_all: pd.DataFrame,
-                             mt5_start: pd.Timestamp, params: dict) -> dict:
+                             mt5_start: pd.Timestamp, params: dict,
+                             min_sl_distance: float = 0.0) -> dict:
     cfg = SESSION[canonical]
 
     o  = df_all["open"].values.astype(np.float64)
@@ -601,6 +615,7 @@ def build_cache_and_signals(canonical: str, df_all: pd.DataFrame,
         "cfg":              cfg,
         "n_weeks":          n_mt5 / (12 * 24 * 5),
         "params":           params,
+        "min_sl_distance":  min_sl_distance,
     }
 
 
@@ -623,7 +638,17 @@ def build_master_timeline(caches: dict) -> list:
 # ==============================================================================
 
 def _entry_params(cache: dict, si: int):
-    """Shared entry price, sl_dist, direction for all modes."""
+    """Shared entry price, sl_dist, direction for all modes.
+
+    SL CLAMP (matches live's clamp_sl / get_min_sl_distance): the live
+    engine will never place a stop closer to price than the broker's
+    `trade_stops_level`; if the strategy's computed sl_dist is tighter than
+    that, live widens it before sending the order. The backtest previously
+    had no equivalent, so it could implicitly assume tighter stops (and
+    therefore a different realized R-multiple, and different BE/trail
+    timing) than what actually executes live. `cache["min_sl_distance"]`
+    is populated at build time from fetch_broker_info().
+    """
     o      = cache["o"]
     h      = cache["h"]
     l      = cache["l"]
@@ -647,6 +672,11 @@ def _entry_params(cache: dict, si: int):
 
     sl_mult = params["sl_range_mult"]
     sl_dist = max(sl_mult * or_size, atr * 0.05)
+
+    min_sl_distance = cache.get("min_sl_distance", 0.0)
+    if sl_dist < min_sl_distance:
+        sl_dist = min_sl_distance   # widen to broker's minimum, same as live's clamp_sl
+
     if sl_dist <= 0:
         return None
 
@@ -660,14 +690,7 @@ def _entry_params(cache: dict, si: int):
 # ── MODE A: BE + ATR trail (original) ─────────────────────────────────────
 
 def resolve_mode_a(cache: dict, si: int):
-    """Original: BE at 1R then ATR trailing stop.
-
-    Spread handling (checked): longs buy at ask (spread added on entry only;
-    exit/stop sells at bid, no spread). Shorts sell at bid on entry (no
-    spread); exit/stop buys back at ask, so spread IS added on the exit side
-    (`bh + sp_bi >= cur_sl`). This mode was already symmetric — see Mode B
-    below for where the asymmetry bug actually was.
-    """
+    """Original: BE at 1R then ATR trailing stop."""
     ep_info = _entry_params(cache, si)
     if ep_info is None:
         return None, 0, 0.0, 0.0
@@ -744,20 +767,6 @@ def resolve_mode_a(cache: dict, si: int):
 
 def resolve_mode_b(cache: dict, si: int, rr_target: float,
                    sl_multiplier: float = 1.0):
-    """
-    Fixed stop, single RR exit target.
-    sl_multiplier=1.0  →  Mode B (normal SL)
-    sl_multiplier=2.0  →  Mode C (wide SL)
-
-    FIX: the short-side take-profit check previously read `bl <= tp` with
-    no spread added. Closing a short means BUYING BACK, which fills at the
-    ask (bid + spread) — same reasoning already correctly applied to the
-    short stop-loss check two lines below. Without the spread term, short
-    TPs could fire on bars where the ask never actually reached the target,
-    silently inflating win rate / expectancy for every short trade in modes
-    B and C (this bug did not exist in Mode A, which never exits on a raw
-    TP touch).
-    """
     ep_info = _entry_params(cache, si)
     if ep_info is None:
         return None, 0, 0.0, 0.0
@@ -793,7 +802,6 @@ def resolve_mode_b(cache: dict, si: int, rr_target: float,
         bh, bl = h[bi], l[bi]
         sp_bi  = spread[bi]
 
-        # TP hit — FIXED: short TP must clear ask (bl + sp_bi), not raw bid low
         if direction == 1  and bh >= tp:
             outcome_r = rr_target
             exit_bar  = bi; closed = True; break
@@ -801,7 +809,6 @@ def resolve_mode_b(cache: dict, si: int, rr_target: float,
             outcome_r = rr_target
             exit_bar  = bi; closed = True; break
 
-        # SL hit
         if direction == 1  and bl <= cur_sl:
             outcome_r = -1.0
             exit_bar  = bi; closed = True; break
@@ -842,18 +849,8 @@ def compute_vol_max_cap(sl_dist, tick_value_per_lot, max_trades_per_day_combo):
     return round(cap, 8)
 
 
-# ── Chronological entry/exit resolution ─────────────────────────────────────
-# Every trade is pre-resolved (price-action only, balance-independent), then
-# replayed as a merged, true-chronological stream of ENTRY/EXIT events so
-# that lot sizing at ENTRY only ever reflects balance actually realized by
-# prior EXITS — never PnL from a trade still open in real time.
-
 def _resolve_all_trades(symbols: list, caches: dict, resolver_fn,
                          direction_filter: int = None) -> list:
-    """Pre-resolve every signal's outcome and attach entry/exit timestamps.
-
-    direction_filter: None = all signals, 1 = long-only, -1 = short-only.
-    """
     trades = []
     for sym in symbols:
         cache = caches[sym]
@@ -868,15 +865,13 @@ def _resolve_all_trades(symbols: list, caches: dict, resolver_fn,
             trades.append({
                 "sym": sym, "si": si, "cache": cache,
                 "entry_time": entry_time, "exit_time": exit_time,
-                "outcome_r": outcome_r, "sl_dist": sl_dist,
+                "outcome_r": outcome_r, "sl_dist": sl_dist, "ep": ep,
             })
     trades.sort(key=lambda t: t["entry_time"])
     return trades
 
 
 def _build_chrono_events(trades: list) -> list:
-    """Merge entries and exits into one chronologically sorted event list.
-    On an exact timestamp tie, EXIT is processed before ENTRY."""
     events = []
     for idx, t in enumerate(trades):
         events.append((t["entry_time"], 1, idx))  # 1 = ENTRY
@@ -885,14 +880,62 @@ def _build_chrono_events(trades: list) -> list:
     return events
 
 
+def _check_margin_and_downsize(lot: float, sl_dist: float, ep: float,
+                                contract_size: float, leverage: float,
+                                free_margin: float, vol_max_cap: float):
+    """
+    Mirrors execute_entry()'s MD-1 margin-downsize patch from the live
+    engine exactly:
+      1. required_margin = lot * contract_size * price / leverage
+      2. if free_margin < required_margin * 1.10: try to downsize to the
+         largest lot that fits in 90% of free_margin.
+      3. reject if the downsized lot is still < VOL_MIN or still doesn't fit.
+    Returns (final_lot_or_None, required_margin, was_downsized: bool).
+    """
+    if leverage <= 0 or contract_size <= 0 or ep <= 0:
+        return lot, 0.0, False
+
+    required_margin = lot * contract_size * ep / leverage
+    required_with_buffer = required_margin * 1.10
+
+    if free_margin >= required_with_buffer:
+        return lot, required_margin, False
+
+    # MD-1: attempt downsize
+    available_margin_with_buffer = free_margin * 0.90
+    if required_margin <= 0:
+        return None, 0.0, False
+    max_lot = lot * (available_margin_with_buffer / required_margin)
+    max_lot = max(VOL_MIN, min(max_lot, vol_max_cap))
+    max_lot = (int(max_lot / VOL_STEP) * VOL_STEP)
+    max_lot = round(max_lot, 8)
+
+    if max_lot < VOL_MIN:
+        return None, 0.0, False
+
+    new_required_margin = max_lot * contract_size * ep / leverage
+    if free_margin < new_required_margin * 1.10:
+        return None, 0.0, False
+
+    return max_lot, new_required_margin, True
+
+
 def _run_simulation_core(combo_name: str, mode_label: str,
                           symbols: list, all_caches: dict,
-                          tick_values: dict,
+                          broker_info: dict, account_leverage: float,
                           resolver_fn,
                           direction_filter: int = None) -> dict:
     """
     Generic simulation loop. resolver_fn(cache, si) → (outcome_r, exit_bar, ep, sl_dist).
     Returns a results dict + populated RTracker.
+
+    MARGIN (mirrors execute_entry's MD-1 patch): `used_margin` tracks margin
+    reserved by every currently-open (entered, not yet exited) trade in the
+    chronological replay. At each ENTRY, `free_margin = balance - used_margin`
+    (balance approximates equity, ignoring floating P&L of open trades — the
+    same simplification the rest of this backtest already makes). If margin
+    is insufficient, the trade is downsized exactly like live, or rejected if
+    even VOL_MIN doesn't fit. Margin is released back at EXIT.
     """
     param_set = {sym: PARAMS_GRID_BEST[sym] for sym in symbols}
     max_trades_per_day_combo = sum(
@@ -909,36 +952,60 @@ def _run_simulation_core(combo_name: str, mode_label: str,
     max_dd   = 0.0
     day_pnl: dict = {}
     max_day_loss  = 0.0
+    used_margin   = 0.0
 
-    per_sym = {sym: {"r": [], "pnl": [], "rejected": 0} for sym in symbols}
+    per_sym = {sym: {"r": [], "pnl": [], "rejected": 0, "margin_downsized": 0,
+                      "margin_rejected": 0} for sym in symbols}
     r_tracker = RTracker(combo_name, mode_label)
-    open_state: dict = {}   # idx -> {"lot": float, "rejected": bool}
+    open_state: dict = {}   # idx -> {"lot", "rejected", "margin"}
 
     for t_time, etype, idx in chrono:
         t     = trades[idx]
         sym   = t["sym"]
         cache = t["cache"]
-        tvpl  = tick_values[sym]
+        tvpl  = broker_info[sym]["tvpl"]
+        contract_size = broker_info[sym]["contract_size"]
         sl_dist = t["sl_dist"]
+        ep      = t["ep"]
 
-        if etype == 1:  # ENTRY — size using balance realized so far
+        if etype == 1:  # ENTRY
             vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day_combo)
             lot, intended, actual_loss, risk_mult, rejected = \
                 compute_lot_aware(balance, sl_dist, tvpl, vol_max_cap)
-            open_state[idx] = {"lot": lot, "rejected": rejected}
+
+            margin_used_now = 0.0
+            downsized = False
+            if not rejected:
+                free_margin = balance - used_margin
+                new_lot, margin_used_now, downsized = _check_margin_and_downsize(
+                    lot, sl_dist, ep, contract_size, account_leverage,
+                    free_margin, vol_max_cap
+                )
+                if new_lot is None:
+                    rejected = True
+                    per_sym[sym]["margin_rejected"] += 1
+                else:
+                    if downsized:
+                        per_sym[sym]["margin_downsized"] += 1
+                    lot = new_lot
+
+            open_state[idx] = {"lot": lot, "rejected": rejected, "margin": margin_used_now}
             if rejected:
                 per_sym[sym]["rejected"] += 1
+            else:
+                used_margin += margin_used_now
             continue
 
-        # etype == 0: EXIT — realize PnL into balance now
+        # etype == 0: EXIT
         st = open_state.get(idx)
         if st is None or st["rejected"]:
             continue
         lot = st["lot"]
+        used_margin -= st["margin"]
         outcome_r = t["outcome_r"]
 
         pnl  = outcome_r * lot * sl_dist * tvpl
-        pnl -= lot * COMMISSION_PER_LOT.get(sym, 0.0)   # round-turn commission
+        pnl -= lot * COMMISSION_PER_LOT.get(sym, 0.0)
         balance += pnl
         peak_bal = max(peak_bal, balance)
         dd       = (peak_bal - balance) / peak_bal if peak_bal > 0 else 0.0
@@ -964,6 +1031,8 @@ def _run_simulation_core(combo_name: str, mode_label: str,
 
     all_r   = np.array([v for s in symbols for v in per_sym[s]["r"]])
     total_rej = sum(per_sym[s]["rejected"] for s in symbols)
+    total_margin_rej = sum(per_sym[s]["margin_rejected"] for s in symbols)
+    total_margin_ds  = sum(per_sym[s]["margin_downsized"] for s in symbols)
     nt      = len(all_r)
     wr      = float((all_r > 0).sum() / nt)   if nt > 0 else 0.0
     ex      = float(all_r.mean())              if nt > 0 else 0.0
@@ -974,18 +1043,20 @@ def _run_simulation_core(combo_name: str, mode_label: str,
     ret     = (balance - STARTING_BALANCE) / STARTING_BALANCE
 
     result = {
-        "combo":           combo_name,
-        "mode":            mode_label,
-        "symbols":         "+".join(symbols),
-        "trades":          nt,
-        "rejected":        total_rej,
-        "win_rate":        round(wr, 4),
-        "expectancy_r":    round(ex, 4),
-        "profit_factor":   round(pf, 4),
-        "mdd_pct":         round(max_dd * 100, 2),
-        "max_day_loss_pct": round(max_day_loss / STARTING_BALANCE * 100, 2),
-        "return_pct":      round(ret * 100, 2),
-        "final_balance":   round(balance, 2),
+        "combo":              combo_name,
+        "mode":               mode_label,
+        "symbols":            "+".join(symbols),
+        "trades":             nt,
+        "rejected":           total_rej,
+        "margin_rejected":    total_margin_rej,
+        "margin_downsized":   total_margin_ds,
+        "win_rate":           round(wr, 4),
+        "expectancy_r":       round(ex, 4),
+        "profit_factor":      round(pf, 4),
+        "mdd_pct":            round(max_dd * 100, 2),
+        "max_day_loss_pct":   round(max_day_loss / STARTING_BALANCE * 100, 2),
+        "return_pct":         round(ret * 100, 2),
+        "final_balance":      round(balance, 2),
     }
     return result, r_tracker
 
@@ -995,38 +1066,31 @@ def _run_simulation_core(combo_name: str, mode_label: str,
 # ==============================================================================
 
 def run_combo_all_modes(combo_name: str, symbols: list,
-                         all_caches: dict, tick_values: dict) -> dict:
-    """
-    Runs Mode A, Mode A (long-only), Mode B×RR_TARGETS, Mode C×RR_TARGETS
-    for one combo. Returns a summary dict; no per-mode printing (see
-    SECTION 11 for the consolidated tables).
-    """
+                         all_caches: dict, broker_info: dict,
+                         account_leverage: float) -> dict:
     results_by_mode = {}
     trackers_by_mode = {}
 
-    # ── Mode A: current (BE + trail), both directions ──────────────────────
     res_a, tracker_a = _run_simulation_core(
-        combo_name, "A:BE+TRAIL", symbols, all_caches, tick_values,
+        combo_name, "A:BE+TRAIL", symbols, all_caches, broker_info, account_leverage,
         lambda cache, si: resolve_mode_a(cache, si)
     )
     results_by_mode["A:BE+TRAIL"] = res_a
     trackers_by_mode["A:BE+TRAIL"] = tracker_a
 
-    # ── Mode A, LONG ONLY ────────────────────────────────────────────────
     res_a_long, tracker_a_long = _run_simulation_core(
-        combo_name, "A:LONG_ONLY", symbols, all_caches, tick_values,
+        combo_name, "A:LONG_ONLY", symbols, all_caches, broker_info, account_leverage,
         lambda cache, si: resolve_mode_a(cache, si),
         direction_filter=1,
     )
     results_by_mode["A:LONG_ONLY"] = res_a_long
     trackers_by_mode["A:LONG_ONLY"] = tracker_a_long
 
-    # ── Mode B: fixed SL + RR ladder ─────────────────────────────────────
     best_b = None
     for rr in RR_TARGETS:
         label = f"B:RR{rr}"
         res, tracker = _run_simulation_core(
-            combo_name, label, symbols, all_caches, tick_values,
+            combo_name, label, symbols, all_caches, broker_info, account_leverage,
             lambda cache, si, _rr=rr: resolve_mode_b(cache, si, _rr,
                                                       sl_multiplier=1.0)
         )
@@ -1035,12 +1099,11 @@ def run_combo_all_modes(combo_name: str, symbols: list,
         if best_b is None or res["expectancy_r"] > best_b["expectancy_r"]:
             best_b = res
 
-    # ── Mode C: wide SL (×2) + RR ladder ─────────────────────────────────
     best_c = None
     for rr in RR_TARGETS:
         label = f"C:WIDE_RR{rr}"
         res, tracker = _run_simulation_core(
-            combo_name, label, symbols, all_caches, tick_values,
+            combo_name, label, symbols, all_caches, broker_info, account_leverage,
             lambda cache, si, _rr=rr: resolve_mode_b(cache, si, _rr,
                                                       sl_multiplier=WIDE_SL_MULT)
         )
@@ -1061,8 +1124,7 @@ def run_combo_all_modes(combo_name: str, symbols: list,
 
 
 # ==============================================================================
-#  SECTION 11 — CONSOLIDATED SUMMARY TABLES  (replaces thousands of lines
-#               of per-trade / per-mode / per-cycle logging with 6 tables)
+#  SECTION 11 — CONSOLIDATED SUMMARY TABLES
 # ==============================================================================
 
 def _print_df(title: str, df: pd.DataFrame):
@@ -1075,7 +1137,6 @@ def _print_df(title: str, df: pd.DataFrame):
 
 
 def build_table_exit_mode_comparison(all_combo_results: list) -> pd.DataFrame:
-    """TABLE 1 — Combo x Mode: trades, WR%, AvgR, PF, MDD%, Return%, Balance."""
     rows = []
     for cr in all_combo_results:
         for label, res in [("A:BE+TRAIL", cr["mode_A"]),
@@ -1086,6 +1147,8 @@ def build_table_exit_mode_comparison(all_combo_results: list) -> pd.DataFrame:
                 "Combo":    cr["combo"],
                 "Mode":     label,
                 "Trades":   res["trades"],
+                "MarginDS": res["margin_downsized"],
+                "MarginRej": res["margin_rejected"],
                 "WinRate%": round(res["win_rate"] * 100, 1),
                 "AvgR":     res["expectancy_r"],
                 "PF":       res["profit_factor"],
@@ -1097,7 +1160,6 @@ def build_table_exit_mode_comparison(all_combo_results: list) -> pd.DataFrame:
 
 
 def build_table_winner_per_combo(all_combo_results: list) -> pd.DataFrame:
-    """TABLE 2 — Best mode per combo by expectancy R (MDD tiebreak)."""
     rows = []
     for cr in all_combo_results:
         candidates = [cr["mode_A"], cr["mode_A_long"], cr["best_B"], cr["best_C"]]
@@ -1115,7 +1177,6 @@ def build_table_winner_per_combo(all_combo_results: list) -> pd.DataFrame:
 
 
 def build_table_rr_ladder(all_combo_results: list) -> pd.DataFrame:
-    """TABLE 3 — Expectancy R by combo x RR rung, modes B and C."""
     rows = []
     for cr in all_combo_results:
         am  = cr["all_modes"]
@@ -1130,11 +1191,6 @@ def build_table_rr_ladder(all_combo_results: list) -> pd.DataFrame:
 
 
 def build_table_monthly(all_combo_results: list, mode_label: str) -> pd.DataFrame:
-    """TABLE — Monthly breakdown for one mode, aggregated across all combos
-    that include it. SumR is also shown as an approximate % of starting
-    balance (SumR x RISK_PER_TRADE x 100) — this is an approximation that
-    assumes each trade risked the standard RISK_PER_TRADE fraction; actual
-    compounding/lot-rounding will differ slightly from this figure."""
     frames = []
     for cr in all_combo_results:
         tracker = cr["trackers"].get(mode_label)
@@ -1171,7 +1227,6 @@ def build_table_monthly(all_combo_results: list, mode_label: str) -> pd.DataFram
 
 
 def build_table_ftmo_pass_rate(eval_summary: dict) -> pd.DataFrame:
-    """TABLE — FTMO eval pass rate (%) by combo x mode."""
     rows = []
     for combo_name, mode_rates in eval_summary.items():
         row = {"Combo": combo_name}
@@ -1216,16 +1271,9 @@ EVAL_TOTAL_DD_LIM = 0.10
 EVAL_MIN_DAYS     = 4
 
 
-def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
+def run_eval_simulation(symbols: list, caches: dict, broker_info: dict,
+                         account_leverage: float,
                          resolver_fn=None, direction_filter: int = None) -> list:
-    """
-    resolver_fn(cache, si) -> (outcome_r, exit_bar, ep, sl_dist).
-    Defaults to resolve_mode_a (BE+trail) if not supplied.
-
-    Uses the same chronological entry/exit replay as _run_simulation_core so
-    lot sizing at ENTRY only ever reflects balance actually realized by
-    prior EXITS.
-    """
     if resolver_fn is None:
         resolver_fn = resolve_mode_a
 
@@ -1235,7 +1283,8 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
 
     trades = _resolve_all_trades(symbols, caches, resolver_fn, direction_filter)
     chrono = _build_chrono_events(trades)
-    open_state: dict = {}   # idx -> {"lot": float, "rejected": bool}  (persists across phases)
+    open_state: dict = {}
+    used_margin_holder = [0.0]   # persists across phases, mutable via closure
 
     def run_phase(target_pct, event_idx):
         nonlocal balance
@@ -1252,14 +1301,31 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
             t     = trades[idx]
             sym   = t["sym"]
             cache = t["cache"]
-            tvpl  = tick_values[sym]
+            tvpl  = broker_info[sym]["tvpl"]
+            contract_size = broker_info[sym]["contract_size"]
             sl_dist = t["sl_dist"]
+            ep      = t["ep"]
 
             if etype == 1:  # ENTRY
                 vol_max_cap = compute_vol_max_cap(sl_dist, tvpl, max_trades_per_day)
                 lot, _, _, _, rejected = compute_lot_aware(
                     balance, sl_dist, tvpl, vol_max_cap)
-                open_state[idx] = {"lot": lot, "rejected": rejected}
+
+                margin_used_now = 0.0
+                if not rejected:
+                    free_margin = balance - used_margin_holder[0]
+                    new_lot, margin_used_now, _ = _check_margin_and_downsize(
+                        lot, sl_dist, ep, contract_size, account_leverage,
+                        free_margin, vol_max_cap
+                    )
+                    if new_lot is None:
+                        rejected = True
+                    else:
+                        lot = new_lot
+
+                open_state[idx] = {"lot": lot, "rejected": rejected, "margin": margin_used_now}
+                if not rejected:
+                    used_margin_holder[0] += margin_used_now
                 continue
 
             # etype == 0: EXIT
@@ -1267,6 +1333,7 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
             if st is None or st["rejected"]:
                 continue
             lot = st["lot"]
+            used_margin_holder[0] -= st["margin"]
             outcome_r = t["outcome_r"]
 
             pnl  = outcome_r * lot * sl_dist * tvpl
@@ -1295,6 +1362,7 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
 
     while event_idx[0] < len(chrono):
         balance = STARTING_BALANCE
+        used_margin_holder[0] = 0.0
 
         p1_pass, p1_days, p1_trades, p1_reason = run_phase(EVAL_P1_TARGET, event_idx)
 
@@ -1320,11 +1388,8 @@ def run_eval_simulation(symbols: list, caches: dict, tick_values: dict,
 def main():
     logger.info(f"\n{'='*80}")
     logger.info(f"  RUN CONFIG")
-    logger.info(f"  Starting balance : ${STARTING_BALANCE:,.2f}"
-                f"  (set this to your actual live balance on"
-                f" TRADE_START_DATE for a representative comparison)")
-    logger.info(f"  Trade start date : {TRADE_START_DATE!r}"
-                f"  (ATR/indicators still warm up on full prior history)")
+    logger.info(f"  Starting balance : ${STARTING_BALANCE:,.2f}")
+    logger.info(f"  Trade start date : {TRADE_START_DATE!r}")
     logger.info(f"  Commission/lot   : {COMMISSION_PER_LOT}")
     logger.info(f"{'='*80}\n")
 
@@ -1334,11 +1399,11 @@ def main():
             raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
         logger.info("MT5 connected")
     else:
-        logger.warning("MT5 not available — using fallback tick values")
+        logger.warning("MT5 not available — using fallback broker info")
 
-    logger.info("\n=== TICK VALUES ===")
-    tick_values = fetch_tick_values()
-    logger.info("=== END TICK VALUES ===\n")
+    logger.info("\n=== BROKER INFO (tick value, min SL distance, contract size, leverage) ===")
+    broker_info, account_leverage = fetch_broker_info()
+    logger.info("=== END BROKER INFO ===\n")
 
     if not MT5_AVAILABLE:
         logger.error("MT5 required for signal-window data. Exiting.")
@@ -1357,8 +1422,10 @@ def main():
         if df_all is None:
             logger.warning(f"  [{sym}] skipped — no data")
             continue
-        cache = build_cache_and_signals(sym, df_all, mt5_start,
-                                         PARAMS_GRID_BEST[sym])
+        cache = build_cache_and_signals(
+            sym, df_all, mt5_start, PARAMS_GRID_BEST[sym],
+            min_sl_distance=broker_info[sym]["min_sl_distance"],
+        )
         all_caches[sym] = cache
 
     mt5.shutdown()
@@ -1381,16 +1448,15 @@ def main():
         combo_name = "+".join(combo)
         logger.info(f"  running combo: {combo_name} ...")
 
-        cr = run_combo_all_modes(combo_name, list(combo), all_caches, tick_values)
+        cr = run_combo_all_modes(combo_name, list(combo), all_caches,
+                                  broker_info, account_leverage)
         all_combo_results.append(cr)
 
         for mode_label, res in cr["all_modes"].items():
             flat_rows.append(res)
 
-    # ── CSV outputs (full data still saved, just not dumped to the log) ────
     pd.DataFrame(flat_rows).to_csv("orb_combo_sweep.csv", index=False)
 
-    # ── FTMO eval — all combos x all exit modes (incl. Mode A long-only) ───
     eval_combos = [cr["combo"].split("+") for cr in all_combo_results]
 
     eval_modes: dict = {
@@ -1424,7 +1490,7 @@ def main():
 
         for mode_label, (resolver_fn, direction_filter) in eval_modes.items():
             cycles = run_eval_simulation(
-                symbols, caches, tick_values,
+                symbols, caches, broker_info, account_leverage,
                 resolver_fn=resolver_fn, direction_filter=direction_filter,
             )
             total  = len(cycles)
@@ -1439,7 +1505,6 @@ def main():
 
     pd.DataFrame(all_eval_cycles).to_csv("orb_eval_cycles.csv", index=False)
 
-    # ── The only console/log output now: 6 consolidated tables ─────────────
     print_all_summary_tables(all_combo_results, eval_summary)
 
     logger.info(
