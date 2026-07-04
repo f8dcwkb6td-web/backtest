@@ -1595,6 +1595,25 @@ def find_matching_signal(cache: dict, entry_time: pd.Timestamp, direction: int):
     return None
 
 
+def fetch_live_entry_sl(date_from: pd.Timestamp, date_to: pd.Timestamp) -> dict:
+    """Map position_id -> the SL price actually requested on the entry order,
+    so we can compute R normalized to LIVE's own real risk instead of the
+    backtest's assumed sl_dist. If live's real R on a loss ever exceeds
+    ~1.0 in magnitude, that means the stop didn't actually cap the loss at
+    the intended risk — a genuine execution/stop-management issue, not
+    slippage in the ordinary sense."""
+    orders = mt5.history_orders_get(date_from.to_pydatetime(), date_to.to_pydatetime())
+    sl_by_position: dict = {}
+    if not orders:
+        return sl_by_position
+    for o in orders:
+        if o.magic != LIVE_MAGIC:
+            continue
+        if o.position_id and o.sl and o.sl > 0 and o.position_id not in sl_by_position:
+            sl_by_position[o.position_id] = o.sl   # first SL seen = the original entry SL
+    return sl_by_position
+
+
 def run_live_vs_backtest_diff(all_caches: dict, broker_info: dict,
                                date_from: pd.Timestamp, date_to: pd.Timestamp) -> None:
     """Runs entirely inside the same process/file as the backtest — uses the
@@ -1611,11 +1630,23 @@ def run_live_vs_backtest_diff(all_caches: dict, broker_info: dict,
         return
     logger.info(f"  [live-diff] Found {len(live_trades)} closed round-trip live trades.")
 
+    # FIX: map EVERY alias in SYMBOL_ALIASES to its canonical symbol, not just
+    # whichever single alias resolve_symbol() currently picks. A deal's
+    # `symbol` field records whatever the broker used AT THE TIME OF THE
+    # TRADE, which can be a different (also-valid) alias than the one
+    # resolve_symbol() happens to return today — that mismatch was silently
+    # dropping real trades into "unmatched" for no logic reason at all.
     canon_map = {}
     for canon in SYMBOLS:
-        broker = resolve_symbol(canon)
-        if broker:
+        for alias in SYMBOL_ALIASES.get(canon, []):
+            canon_map[alias] = canon
+        broker = resolve_symbol(canon)   # keep too, in case broker uses an
+        if broker:                       # unlisted variant not in the alias list
             canon_map[broker] = canon
+
+    sl_by_position = fetch_live_entry_sl(date_from, date_to)
+    logger.info(f"  [live-diff] Found real entry-SL on file for "
+                f"{len(sl_by_position)} positions.")
 
     rows = []
     unmatched_live = []
@@ -1649,21 +1680,44 @@ def run_live_vs_backtest_diff(all_caches: dict, broker_info: dict,
         exit_slip = ((bt_exit_price - lt["exit_price"]) if direction == 1
                       else (lt["exit_price"] - bt_exit_price))
 
+        # Exit TIMING divergence — this is what actually distinguishes
+        # "slightly worse fill" from "the live engine exited on a totally
+        # different bar than the backtest's BE/trail logic would have."
+        bt_exit_time = pd.Timestamp(cache["times"][bt_exit_bar]) + pd.Timedelta(minutes=5)
+        exit_bars_diff = round((lt["exit_time"] - bt_exit_time).total_seconds() / 300.0)
+
+        # Live's R normalized to LIVE's OWN actual risk (from the real SL on
+        # the entry order), not the backtest's assumed sl_dist. If this ever
+        # falls below -1.05 or so, the stop-loss did not actually cap the
+        # loss at the intended 1R — a real stop-management problem.
+        pos_id = lt.get("position_id")
+        live_sl_price = sl_by_position.get(pos_id)
+        live_sl_dist = (abs(lt["entry_price"] - live_sl_price)
+                         if live_sl_price is not None else None)
+        live_r_own = (round(live_pnl / (lt["volume"] * live_sl_dist * tvpl), 4)
+                       if live_sl_dist and live_sl_dist > 0 else float("nan"))
+        sl_breached = bool(live_r_own == live_r_own and live_r_own < -1.05)  # nan-safe
+
         rows.append({
-            "Symbol":    canon,
-            "Dir":       "LONG" if direction == 1 else "SHORT",
-            "EntryTime": lt["entry_time"],
-            "LiveEntry": round(lt["entry_price"], 5),
-            "BTEntry":   round(bt_ep, 5),
-            "EntrySlip": round(entry_slip, 5),
-            "LiveExit":  round(lt["exit_price"], 5),
-            "BTExit~":   round(bt_exit_price, 5),
-            "ExitSlip~": round(exit_slip, 5),
-            "LiveR":     round(live_pnl / (lt["volume"] * bt_sl_dist * tvpl), 4)
-                          if bt_sl_dist * tvpl != 0 else float("nan"),
-            "BTR":       round(bt_outcome_r, 4),
-            "LivePnL":   round(live_pnl, 2),
-            "BTPnL":     round(bt_pnl, 2),
+            "Symbol":      canon,
+            "Dir":         "LONG" if direction == 1 else "SHORT",
+            "EntryTime":   lt["entry_time"],
+            "LiveEntry":   round(lt["entry_price"], 5),
+            "BTEntry":     round(bt_ep, 5),
+            "EntrySlip":   round(entry_slip, 5),
+            "LiveExit":    round(lt["exit_price"], 5),
+            "BTExit~":     round(bt_exit_price, 5),
+            "ExitSlip~":   round(exit_slip, 5),
+            "ExitBarsΔ":   exit_bars_diff,
+            "LiveSLDist":  round(live_sl_dist, 5) if live_sl_dist is not None else None,
+            "BTSLDist":    round(bt_sl_dist, 5),
+            "LiveR(ownSL)": live_r_own,
+            "LiveR(btSL)": round(live_pnl / (lt["volume"] * bt_sl_dist * tvpl), 4)
+                            if bt_sl_dist * tvpl != 0 else float("nan"),
+            "BTR":         round(bt_outcome_r, 4),
+            "LivePnL":     round(live_pnl, 2),
+            "BTPnL":       round(bt_pnl, 2),
+            "SL_BREACHED": sl_breached,
         })
 
     if rows:
@@ -1688,6 +1742,29 @@ def run_live_vs_backtest_diff(all_caches: dict, broker_info: dict,
         logger.info(f"\n  TOTAL over matched trades: Live=${total_live:,.2f}  "
                     f"Backtest(no-slippage)=${total_bt:,.2f}  "
                     f"Gap=${total_bt-total_live:,.2f}")
+
+        # ── The signals that actually distinguish "slippage" from "logic
+        # divergence": a stop-loss losing MORE than its own configured risk,
+        # and exits landing on a materially different bar than the backtest's
+        # BE/trail simulation of the SAME entry would have produced.
+        breached = df[df["SL_BREACHED"] == True]
+        if len(breached):
+            logger.warning(f"\n  *** {len(breached)} TRADE(S) LOST MORE THAN 1R AGAINST "
+                           f"THEIR OWN REAL STOP — not slippage, a real stop-management "
+                           f"issue: ***")
+            _print_df("SL-BREACHED TRADES (LiveR(ownSL) < -1.05)",
+                      breached[["Symbol","Dir","EntryTime","LiveEntry","LiveExit",
+                                "LiveSLDist","LiveR(ownSL)","LivePnL"]])
+
+        big_timing_divergence = df[df["ExitBarsΔ"].abs() >= 3]
+        if len(big_timing_divergence):
+            logger.warning(f"\n  *** {len(big_timing_divergence)} TRADE(S) EXITED 3+ BARS "
+                           f"(15+ min) AWAY FROM where the backtest's BE/trail logic "
+                           f"would have exited the SAME entry — this is a live-vs-"
+                           f"backtest LOGIC divergence, not price slippage: ***")
+            _print_df("LARGE EXIT-TIMING DIVERGENCE (|ExitBarsΔ| >= 3)",
+                      big_timing_divergence[["Symbol","Dir","EntryTime","ExitBarsΔ",
+                                              "LiveR(btSL)","BTR","LivePnL","BTPnL"]])
 
         df.to_csv("orb_live_vs_backtest_diff.csv", index=False)
         logger.info("  Saved: orb_live_vs_backtest_diff.csv")
